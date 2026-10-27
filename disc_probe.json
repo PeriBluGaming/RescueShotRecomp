@@ -1,0 +1,31 @@
+{
+  "cue_path": "/Users/dominikblunck/Documents/Entwicklung/recomp/rescue_shot/Rescue Shot (Europe) (En,Fr,De,Es,It).cue",
+  "cue_name": "Rescue Shot (Europe) (En,Fr,De,Es,It).cue",
+  "bin_name": "Rescue Shot (Europe) (En,Fr,De,Es,It).bin",
+  "track_count": 1,
+  "data_track_size": 578276832,
+  "data_track_md5": "618503035eba943fe514575dccccbcca",
+  "data_track_sha1": "70ee5a3d719253a503613c050148fee4a2729612",
+  "data_track_crc32": "0a46ebac",
+  "boot_exe": "SCES_025.69",
+  "serial": "SCES-02569",
+  "serial_exe": "SCES_025.69",
+  "volume_id": "RESCUE_SHOT",
+  "display_name": "RescueShot",
+  "load_address": "0x00010000",
+  "entry_pc": "0x0001660C",
+  "text_size": "0x0004D000",
+  "stack_base": "0x801FFFF0",
+  "require_cue": true,
+  "required_disc_fp": "dbc1a94b9dc17eb690d2b2abe18ef187046a3a4858ec2b0b89c99a3bd9141511",
+  "boot_exe_sha256": "6f0115d61868a3136ac6f956c3c9d8c3633f91e9d0a3cee072e04715d4355b31",
+  "seed_count": 295,
+  "warnings": [
+    "cue has only 1 TRACK \u2014 Track-01-only dumps fail multi-track netplay/catalog gates; prefer a full Redump cue."
+  ],
+  "notes": [
+    "entry_pc/load_address/text_size/stack_base taken from PS-X EXE header.",
+    "seeds are first-pass boot-EXE JAL targets (+ entry); expect to grow as overlays / runtime paths are discovered.",
+    "required_disc_fp is psxrecomp-toc-v1 (matches runtime DiscIdentity)."
+  ]
+}
