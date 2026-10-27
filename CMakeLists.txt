@@ -11,6 +11,29 @@ endif()
 
 project(RescueShotRecomp LANGUAGES C CXX)
 
+
+# --- Local framework patches -----------------------------------------------
+# Apply RescueShotRecomp-specific framework extensions before configuring
+# the PSXRecomp runtime. The script is idempotent: patches that are already
+# applied are skipped.
+if(NOT PSXRECOMP_ROOT STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/psxrecomp")
+    message(FATAL_ERROR
+        "Local framework patches require the bundled psxrecomp submodule. "
+        "Use -DPSXRECOMP_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/psxrecomp.")
+endif()
+
+execute_process(
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/apply-framework-patches.sh"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE FRAMEWORK_PATCH_RESULT
+)
+
+if(NOT FRAMEWORK_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Failed to apply local framework patches.")
+endif()
+
+
 # --- Opt-in product surfaces (OFF by default in the framework) -------------
 # Scaffold prompts / flags fill these. Without recomp-ui, PSX_RECOMP_UI is OFF.
 # The wizard (WIZARD_CMAKE_BLOCK / ENABLE_SETUP_WIZARD) is the first-run disc

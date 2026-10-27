@@ -1,0 +1,2540 @@
+diff --git a/docs/PS_MOUSE.md b/docs/PS_MOUSE.md
+new file mode 100644
+index 00000000..29b9c836
+--- /dev/null
++++ b/docs/PS_MOUSE.md
+@@ -0,0 +1,260 @@
++# PlayStation Mouse (SCPH-1030)
++
++The runtime can put an emulated Sony PlayStation Mouse in a controller port and
++drive it with the host (PC) mouse. Games that support the original mouse detect
++it over SIO0 exactly as on hardware: it is a real SIO device with its own ID,
++not a right analog stick fed from mouse motion. The existing optional
++right-stick mouse policy for mod titles ([LOCAL_MOUSE_POLICY.md](LOCAL_MOUSE_POLICY.md))
++is unchanged and independent.
++
++It is off unless a port is configured as `"mouse"`; default behaviour, other
++controller types, memory cards, multitap and rumble are unaffected.
++
++## Enabling it
++
++A title that works with the mouse declares it in its `game.toml`:
++
++```toml
++[controller]
++supports_ps_mouse = true
++```
++
++The launcher then offers **PlayStation Mouse** as Player 1's input source
++(see Launcher). Without the key the source list is unchanged.
++
++Independently of that key, a port's device can be set to `mouse` in the
++existing `[controller]` configuration. There is no separate configuration
++system.
++
++Per install, `settings.toml` next to the executable:
++
++```toml
++[controller]
++p1_device = "mouse"      # PlayStation Mouse in console port 1
++p2_device = "keyboard"   # optional: a pad in port 2
++```
++
++Or as a title default for fresh installs and launcher-less boots, `game.toml`:
++
++```toml
++[controller]
++p1_device = "mouse"
++```
++
++`settings.toml` overrides `game.toml`. Accepted spellings (case-insensitive):
++`mouse`, `ps_mouse`, `playstation_mouse`. `pN_mode` and `pN_deadzone` are
++ignored for a mouse port.
++
++### Launcher
++
++For a title with `supports_ps_mouse = true`, Player 1's source list reads
++None / **PlayStation Mouse** / Keyboard / gamepads. Choosing PlayStation Mouse
++saves `p1_device = "mouse"` in `settings.toml`, and the next start shows it
++selected again; Keyboard, None or a gamepad save that device as before.
++
++This uses recomp-ui's mouse source (`GameInfo.has_mouse_controls` with
++`mouse_source_label = "PlayStation Mouse"` and `mouse_source_only = 1`, behind
++`RECOMP_LAUNCHER_HAS_MOUSE_SOURCE`): the entry is the keyboard-family source
++with `Settings.mouse_enabled = 1`, and the mouse-aim card (sensitivity, invert,
++button binds) other systems use is not shown, since the PlayStation Mouse has
++fixed buttons and 1:1 motion. Pokemon Snap's "Keyboard + Mouse" is unchanged.
++
++The entry exists for Player 1 only (console port 1). Port 2 is set with
++`p2_device = "mouse"`.
++
++Without the entry (a title without `supports_ps_mouse`, or a recomp-ui older
++than `RECOMP_LAUNCHER_HAS_MOUSE_SOURCE`), a mouse port configured in
++`settings.toml` is shown as **Keyboard**, and leaving it on Keyboard keeps the
++mouse; choosing None or a gamepad replaces it.
++
++### Port assignment
++
++Any standalone console port (1 or 2) can hold the mouse. Ports 3-5 exist only
++behind an SCPH-1070 multitap; a multitap seat always presents a digital pad
++instead (see Limitations). With a single multitap, the lone pad on the opposite
++console port may be the mouse.
++
++## Capture and release
++
++When the game window is focused, **left-click inside it** to capture the mouse
++(relative mode; the cursor is hidden and confined). That first click is not
++sent to the game. While captured:
++
++* motion moves the PlayStation Mouse, left/right buttons are its two buttons;
++* these events are not seen by other mouse consumers (menus, mod policy).
++
++The capture is released, and any motion or clicks not yet delivered are
++dropped, on:
++
++* **Esc**;
++* window focus loss, hide or minimize; host mouse removal (SDL3);
++* any frame that is not live gameplay: in-game/launcher menu, save-state menu,
++  rewind, save-state input guard, debug input injection, headless, netplay;
++* save-state load and runtime shutdown.
++
++Click in the window again to recapture.
++
++## How it works
++
++```
++SDL mouse events ──► ps_mouse_sdl.cpp (capture, focus, Esc)
++                      │ xrel/yrel, buttons
++                      ▼
++                    ps_mouse_input.c  host accumulator (float, per-frame latch)
++                      │ once per sampled frame: dx,dy (int8), buttons
++                      ▼
++  main.cpp capture_pad_slot_view ──► PsxNetPad{type=SIO_PAD_MOUSE, lx=dx, ly=dy}
++                      │ pad_ext_resolve (title transform / stick mouse skipped)
++                      ▼
++                    psx_pad_apply_to_sio ──► sio_request_pad_type + sio_set_pad_mouse
++                      ▼
++                    sio.c  device accumulator ──► 0x42 poll on SIO0
++```
++
++### SIO protocol
++
++Verified against PSX-SPX (Controllers and Memory Cards, "Mouse") and Mednafen
++`psx/input/mouse.cpp` (the Beetle PSX core); DuckStation's
++`playstation_mouse.cpp` agrees on ID, order and button bits.
++
++| TX   | RX (mouse)                  | ACK |
++|------|-----------------------------|-----|
++| 01h  | HiZ (FFh)                   | yes |
++| 42h  | 12h (ID low)                | yes |
++| 00h  | 5Ah (ID high)               | yes |
++| xx   | buttons bits 0-7 = FFh      | yes |
++| xx   | buttons bits 8-15           | yes |
++| xx   | X motion, signed, +right    | yes |
++| xx   | Y motion, signed, +down     | no  |
++
++Button halfword, active low: bit 10 = right, bit 11 = left; bits 0-7 and 12-15
++read 1, bits 8-9 read 0, so the idle high byte is FCh (left F4h, right F8h,
++both F0h).
++
++* Any command other than 42h (including the DualShock config commands
++  43h-4Fh): the mouse has already shifted out 12h with the command byte, does
++  not ACK, and the transaction ends. It never enters config mode, has no
++  motors and ignores the 42h data bytes.
++* Motion accumulates in the device between polls. Each poll reports at most
++  -128..+127 per axis and keeps the remainder for the following polls; the
++  accumulator saturates at 30 polls' worth (±30·128), as in Mednafen.
++* Reported motion is consumed by the poll that sends it; it is never sent
++  twice. The frame is built when 42h arrives.
++* A button pressed at any time since the previous poll is reported by the next
++  poll, even if already released; a held button is reported every poll and a
++  release appears on the next poll. (Mednafen reports releases one poll late;
++  this implementation does not.)
++* Without a poll for a quarter second of guest time (33868800/4 cycles) the
++  device drops owed motion and latched clicks (Mednafen's `clear_timeout`), so
++  motion made while a game is not polling (loading) is not replayed later.
++
++### Device switching
++
++The mouse is its own device class, like the NeGcon. A type change requested
++per frame is applied only at an idle SIO bus boundary (never mid-transaction or
++mid config handshake). Switching to or from the mouse is a device swap: it
++applies even over a game's 0x44 mode lock and clears the config latch, the
++lock, the rumble map and all owed mouse motion and clicks. Unplugging a port
++also clears them.
++
++### Host side
++
++`ps_mouse_input.c` sums SDL relative motion as floats (fractional parts are
++carried, which matters for high-DPI and scaled SDL3 deltas), and latches once
++per sampled frame at most one signed byte per axis into the frame, keeping the
++rest. Owed host motion is bounded at the same 30·128. A click shorter than a
++frame still reaches the guest. Every mouse port reads the same latched frame.
++
++### Save states, reset, rewind
++
++The device state (owed motion, current and latched buttons, clear-timer
++reference) is an appended section of the SIO snapshot, so rewind and save
++states restore it; snapshots from before this section still load and restore
++a mouse that owes nothing. `sio_init` (reset) clears it. Host-side owed motion
++is dropped on save-state load and on the save-state input guard.
++
++### Netplay
++
++The mouse is **offline only**. Netplay capture treats a mouse port as having no
++device, and `SIO_PAD_MOUSE` stays above `PSX_NETPAD_TYPE_MAX`, so it is never
++put on the wire and a blob carrying it decodes as digital. Relative motion is
++deterministic once it is in a `PsxNetPad` (it is a pure per-frame input), so
++netplay support would mean raising the wire type limit for peers that all
++understand it plus lobby negotiation; that is not done here.
++
++## Supported platforms
++
++Windows, macOS and Linux through the runtime's SDL2 or SDL3 backend (relative
++mouse mode: `SDL_SetRelativeMouseMode` / `SDL_SetWindowRelativeMouseMode`).
++Touch and pen pseudo-mice are ignored. On Wayland, relative mode requires the
++compositor's pointer-constraints support, as for any SDL game.
++
++## Limitations
++
++* Multitap seats never present a mouse (no verified reference for the mouse in
++  a multitap bulk 80h frame); they fall back to a digital pad.
++* Offline only (see Netplay). Self-check record/replay also stores the pad type
++  through `PSX_NETPAD_TYPE_MAX` and so does not replay mouse input.
++* All mouse ports share the one host mouse; there is no per-device routing.
++* No sensitivity setting yet: one host relative unit (SDL `xrel`/`yrel`) is one
++  PlayStation Mouse unit, like Mednafen's raw mickeys.
++* The launcher entry covers Player 1 only; port 2 is configuration-only.
++* When the optional mod mouse policy is installed and another port uses it,
++  the PlayStation Mouse's capture takes the acquiring left click first.
++
++## Tests
++
++* `sio_mouse_protocol_test` (+ `_multitap_test`, `PSX_MAX_PLAYERS=5`): ID,
++  status, frame length and ACK pattern, neutral frame, left/right press and
++  release, click latching, ±X/±Y, summing between polls, no double reporting,
++  large motion spread over polls and the accumulator bound, the stale clear,
++  unsupported commands (no ACK, no config, motion kept), no rumble, swaps with
++  DualShock (incl. a locked one), digital, NeGcon and JogCon, unplugging,
++  snapshot round trip and pre-mouse snapshots, multitap seats.
++* `ps_mouse_input_test`: host accumulator (sum, fractions, clipping and carry,
++  bound, NaN, clicks, reset).
++* `psx_pad_apply_test`: the shared PsxNetPad -> SIO path for the mouse and that
++  netplay normalization never yields it.
++* `pad_external_input_test`: a mouse port skips the title transform and resets
++  the right-stick mouse policy.
++* `launcher_device_roundtrip_test`: the `mouse` device survives the launcher,
++  and the PlayStation Mouse entry seeds and writes back `p1_device`.
++* `recompiler_patch_test`: `[controller] supports_ps_mouse` is parsed and off
++  by default.
++* recomp-ui `launcher_mouse_source_test`: Snap's "Keyboard + Mouse" unchanged;
++  the host-labelled, source-only entry keeps the host's choice and seeds no
++  mouse-aim defaults.
++* Existing controller tests (digital, DualShock rumble, JogCon, NeGcon, card,
++  multitap) are regression coverage; their legacy-snapshot offsets account for
++  the appended mouse section.
++
++## Checking a title
++
++1. Pick **PlayStation Mouse** in the launcher (title with
++   `supports_ps_mouse = true`), or configure `p1_device = "mouse"` (or
++   `p2_device`, per the game's manual).
++2. Start the game; the OSD says "click in the window to capture".
++3. Detection: most mouse games show a cursor or a mouse option only when a
++   mouse is found. With a debug-tools build (`-DPSX_DEBUG_TOOLS=ON`), the
++   `pad_status` command on port 4370 reports `"type":4` for the port and
++   `mouse_owed` (motion not yet polled); `emu_sio_trace` shows `01 42` answered
++   with `FF 12 5A FF FC ..`.
++4. Capture, move and click; check that the cursor follows in both axes with the
++   right sign and that left/right buttons act.
++
++### Example: Rescue Shot
++
++Rescue Shot supports the PlayStation Mouse. To try it with this runtime:
++
++1. Build the title against this framework checkout (the title's `psxrecomp`
++   submodule pointing at this branch), e.g. from the title root:
++   `cmake --build build-release --target RescueShot_Recompiled`.
++2. Add `supports_ps_mouse = true` to the title's `game.toml` `[controller]`
++   section and pick **PlayStation Mouse** for Player 1 in the launcher, or set
++   `p1_device = "mouse"` in `settings.toml` next to the executable.
++3. Start the game, click into the window, then check that the game reports a
++   mouse, that the crosshair follows the mouse, and that left/right buttons
++   shoot and perform the secondary action.
++
++Whether the game recognises the mouse and plays correctly has to be confirmed
++in an actual play test.
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index d0153ccc..8828377a 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -1260,6 +1260,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
+         if (ct.contains("lock_device")) {
+             rt.controller_lock_device = toml::find<bool>(ct, "lock_device");
+         }
++        if (ct.contains("supports_ps_mouse")) {
++            rt.controller_supports_ps_mouse =
++                toml::find<bool>(ct, "supports_ps_mouse");
++        }
+         if (ct.contains("deadzone")) {
+             const auto n = toml::find<int64_t>(ct, "deadzone");
+             if (n < 0 || n > 32767)
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 4ae0afc6..67ff8e1a 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -836,7 +836,8 @@ struct RuntimeConfig {
+ 
+     // p1_device / p2_device: optional per-game default input sources for
+     // fresh settings and launcher-less boots. Same vocabulary as settings.toml:
+-    // "none", "keyboard", "auto"/"gamepad"/"controller", or an SDL GUID.
++    // "none", "keyboard", "auto"/"gamepad"/"controller", "mouse" (PlayStation
++    // Mouse, docs/PS_MOUSE.md), or an SDL GUID.
+     // Per-install settings.toml still overrides these defaults.
+     bool                  has_default_p1_device = false;
+     bool                  has_default_p2_device = false;
+@@ -858,6 +859,12 @@ struct RuntimeConfig {
+     // segment but keeps the device dropdown). Default false.
+     bool                  controller_lock_device = false;
+ 
++    // supports_ps_mouse: the title works with the PlayStation Mouse
++    // (SCPH-1030). The launcher then offers "PlayStation Mouse" as Player 1's
++    // input source (docs/PS_MOUSE.md). Default false: the source list is
++    // unchanged. settings.toml p1_device/p2_device = "mouse" works either way.
++    bool                  controller_supports_ps_mouse = false;
++
+     // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
+     // Applied both to the stick->d-pad press threshold and the analog-axis centre
+     // dead-band. Absent => runtime default (12000). Overridden per-install by
+@@ -1665,6 +1672,8 @@ struct UserSettings {
+     //   "none"     — no pad in this port (port not connected)
+     //   "keyboard" — driven by the keyboard map (input.ini)
+     //   "<GUID>"   — an SDL game-controller GUID (SDL_JoystickGetGUIDString)
++    //   "mouse"    — a PlayStation Mouse (SCPH-1030) driven by the host mouse
++    //                (docs/PS_MOUSE.md; offline only, not on multitap seats)
+     // Modes (see PadMode): analog / digital. Hybrid is mod-only. Defaults: P1 keyboard,
+     // P2–P5 none. Deadzone default is 10% (3277/32767). TOML keys:
+     // pN_device / pN_mode / pN_deadzone (N=1..5). Legacy bare `deadzone`
+diff --git a/recompiler/tests/recompiler_patch_test.cpp b/recompiler/tests/recompiler_patch_test.cpp
+index 5387ed62..a2fc3236 100644
+--- a/recompiler/tests/recompiler_patch_test.cpp
++++ b/recompiler/tests/recompiler_patch_test.cpp
+@@ -159,6 +159,16 @@ p2_mode = "digital"
+           "parser preserves per-game controller device defaults");
+     check(!controller_defaults_config.runtime.has_multitap_default,
+           "offline multitap keeps the framework default when unset");
++    check(!controller_defaults_config.runtime.controller_supports_ps_mouse,
++          "a title without supports_ps_mouse offers no PlayStation Mouse");
++
++    const auto ps_mouse = write_config(root, "ps-mouse", R"toml(
++[controller]
++supports_ps_mouse = true
++)toml");
++    check(PSXRecompV4::load_game_config(ps_mouse)
++              .runtime.controller_supports_ps_mouse,
++          "parser preserves [controller] supports_ps_mouse");
+ 
+     const auto no_multitap = write_config(root, "no-multitap", R"toml(
+ [controller]
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 73026cc1..0e0d4319 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -841,6 +841,27 @@ if(BUILD_TESTING)
+         PSX_MAX_PLAYERS=5)
+     add_test(NAME sio_negcon_protocol_multitap_test
+              COMMAND sio_negcon_protocol_multitap_test)
++    # PlayStation Mouse (SCPH-1030, ID 0x12) wire protocol, also on a multitap
++    # build where tap seats must not present a mouse.
++    add_executable(sio_mouse_protocol_test
++        tests/test_sio_mouse_protocol.c
++        src/sio.c)
++    target_include_directories(sio_mouse_protocol_test PRIVATE include)
++    add_test(NAME sio_mouse_protocol_test COMMAND sio_mouse_protocol_test)
++    add_executable(sio_mouse_protocol_multitap_test
++        tests/test_sio_mouse_protocol.c
++        src/sio.c)
++    target_include_directories(sio_mouse_protocol_multitap_test PRIVATE include)
++    target_compile_definitions(sio_mouse_protocol_multitap_test PRIVATE
++        PSX_MAX_PLAYERS=5)
++    add_test(NAME sio_mouse_protocol_multitap_test
++             COMMAND sio_mouse_protocol_multitap_test)
++    # Host PlayStation Mouse accumulator (SDL motion -> per-frame deltas).
++    add_executable(ps_mouse_input_test
++        tests/test_ps_mouse_input.c
++        src/ps_mouse_input.c)
++    target_include_directories(ps_mouse_input_test PRIVATE include src)
++    add_test(NAME ps_mouse_input_test COMMAND ps_mouse_input_test)
+     # The shared PsxNetPad -> SIO apply and normalization, over the real SIO.
+     add_executable(psx_pad_apply_test
+         tests/test_psx_pad_apply.c
+diff --git a/runtime/include/launcher_device.h b/runtime/include/launcher_device.h
+index 03988f7b..f8164a1e 100644
+--- a/runtime/include/launcher_device.h
++++ b/runtime/include/launcher_device.h
+@@ -28,17 +28,33 @@ inline std::string normalize_launcher_device(const std::string& device) {
+     return normalized;
+ }
+ 
++// "mouse" (aliases "ps_mouse", "playstation_mouse") puts an SCPH-1030
++// PlayStation Mouse driven by the host mouse in the port.
++inline bool launcher_device_is_ps_mouse(const std::string& device) {
++    const std::string normalized = normalize_launcher_device(device);
++    return normalized == "mouse" || normalized == "ps_mouse" ||
++           normalized == "playstation_mouse";
++}
++
++// recomp-ui offers None / Keyboard / Gamepad. A PlayStation Mouse seat is
++// shown as the host keyboard-and-mouse source (1), and keeping that source
++// keeps the mouse (see launcher_device_from_source); picking None or a
++// gamepad replaces it.
+ inline int launcher_source_from_device(const std::string& device) {
+     const std::string normalized = normalize_launcher_device(device);
+     if (normalized.empty() || normalized == "none") return 0;
+-    if (normalized == "keyboard") return 1;
++    if (normalized == "keyboard" || launcher_device_is_ps_mouse(normalized))
++        return 1;
+     return 2;
+ }
+ 
+ inline std::string launcher_device_from_source(
+     int source, const std::string& previous_device) {
+     if (source <= 0) return "none";
+-    if (source == 1) return "keyboard";
++    if (source == 1) {
++        return launcher_device_is_ps_mouse(previous_device)
++            ? trim_launcher_device(previous_device) : "keyboard";
++    }
+ 
+     // recomp-ui's C ABI currently returns a source category, not the selected
+     // controller GUID. Preserve an existing gamepad/GUID assignment; when the
+@@ -49,6 +65,23 @@ inline std::string launcher_device_from_source(
+     return "gamepad";
+ }
+ 
++// Player 1's PlayStation Mouse entry (game.toml [controller]
++// supports_ps_mouse, recomp-ui RECOMP_LAUNCHER_HAS_MOUSE_SOURCE) is the
++// keyboard-family source with Settings.mouse_enabled = 1.
++inline int launcher_mouse_enabled_from_device(const std::string& device) {
++    return launcher_device_is_ps_mouse(device) ? 1 : 0;
++}
++
++// The keyboard-family source back to a device string. With the entry offered
++// the player's choice decides; without it an existing mouse seat (configured
++// in settings.toml) is kept, as launcher_device_from_source does.
++inline std::string launcher_keyboard_device(bool mouse_entry_offered,
++                                            int mouse_enabled,
++                                            const std::string& previous_device) {
++    if (mouse_entry_offered) return mouse_enabled ? "mouse" : "keyboard";
++    return launcher_device_from_source(1, previous_device);
++}
++
+ // Pad mode for one seat on the way OUT of the launcher.
+ //
+ // Three sources of truth have to be reconciled, and they have a strict
+diff --git a/runtime/include/psx_netplay.h b/runtime/include/psx_netplay.h
+index fe7a8906..2539c972 100644
+--- a/runtime/include/psx_netplay.h
++++ b/runtime/include/psx_netplay.h
+@@ -37,6 +37,12 @@ extern "C" {
+  * wheel position (0x80 centre). NeGcon: lx = twist (0x80 centre), rx = analog
+  * I, ry = analog II, ly = analog L (0 released .. 0xFF pressed). The rollback
+  * row carries only lx/ly (stick view), i.e. NeGcon twist and L.
++ *
++ * SIO_PAD_MOUSE (4) is local-only: offline capture hands it to
++ * psx_pad_apply_to_sio with lx/ly = this frame's signed motion (int8) and the
++ * buttons as SIO_MOUSE_BTN_* (active low). It is never captured for netplay
++ * and stays above PSX_NETPAD_TYPE_MAX, so a wire/replay blob carrying it
++ * still decodes as digital.
+  */
+ 
+ #define PSX_NETPLAY_PAD_BYTES 8
+diff --git a/runtime/include/sio.h b/runtime/include/sio.h
+index 8a8f0468..8816737a 100644
+--- a/runtime/include/sio.h
++++ b/runtime/include/sio.h
+@@ -59,9 +59,17 @@ enum {
+     SIO_PAD_DIGITAL = 0,
+     SIO_PAD_DUALSHOCK = 1,
+     SIO_PAD_JOGCON = 2,
+-    SIO_PAD_NEGCON = 3   /* NPC-101: ID 0x23, twist + analog I/II/L, no config */
++    SIO_PAD_NEGCON = 3,  /* NPC-101: ID 0x23, twist + analog I/II/L, no config */
++    SIO_PAD_MOUSE = 4    /* SCPH-1030: ID 0x12, two buttons + relative X/Y */
+ };
+ 
++/* PlayStation Mouse button bits in the 16-bit button halfword, active low
++ * (PSX-SPX controllersandmemorycards, "Mouse"; Mednafen psx/input/mouse.cpp).
++ * Bits 0-7 and 12-15 read 1, bits 8-9 read 0. */
++#define SIO_MOUSE_BTN_RIGHT 0x0400u
++#define SIO_MOUSE_BTN_LEFT  0x0800u
++#define SIO_MOUSE_BTN_IDLE  0xFCFFu
++
+ /* Phase 1.0c-v2: cycle-paced SIO model. Default 1 enables the dispatch-
+  * loop quantum tick (gated by g_sio_timing_active). Set to 0 to revert
+  * to legacy access-paced behavior across all callers. */
+@@ -163,15 +171,25 @@ void sio_set_pad_type(int slot, int type,
+  * sio_set_pad_analog every frame for the type — that is for boot/hotplug only. */
+ void sio_set_pad_sticks(int slot, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
+ /* Request SIO_PAD_* at the next idle, non-config bus boundary. A game's 0x44
+- * mode lock holds DualShock/digital/JogCon flips; entering or leaving NeGcon is
+- * a device swap that applies anyway and clears the lock, config latch and
+- * motor map (a different controller in the port). */
++ * mode lock holds DualShock/digital/JogCon flips; entering or leaving NeGcon or
++ * the mouse is a device swap that applies anyway and clears the lock, config
++ * latch, motor map and mouse motion (a different controller in the port).
++ * Multitap seats never present a mouse (no verified bulk framing). */
+ void sio_request_pad_type(int slot, int type);
+ /* NeGcon analog buttons I, II and L for the next poll (0 released .. 0xFF
+  * fully pressed). Host input like the sticks; ignored unless the slot reports
+  * SIO_PAD_NEGCON. */
+ void sio_set_pad_negcon(int slot, uint8_t i, uint8_t ii, uint8_t l);
+ void sio_get_pad_negcon(int slot, uint8_t out[3]);
++/* PlayStation Mouse host input for one frame: relative motion (mickeys,
++ * +X right, +Y down) is added to the device's accumulator, and `buttons`
++ * (SIO_MOUSE_BTN_* active low, other bits ignored) is the current button
++ * state. A button pressed at any point between two 0x42 polls is reported
++ * by the next poll even if it was released again (Mednafen mouse.cpp).
++ * Ignored unless the slot reports SIO_PAD_MOUSE. */
++void sio_set_pad_mouse(int slot, int dx, int dy, uint16_t buttons);
++/* Motion still owed to the guest (debug/tests). */
++void sio_get_pad_mouse(int slot, int *dx, int *dy);
+ /* 1 while the game has locked the pad's analog mode (0x44 lock byte 0x03). */
+ int sio_get_pad_mode_locked(int slot);
+ 
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index a8cba8d7..928aad78 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -375,6 +375,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/psx_jogcon_ffb_sdl.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/local_mouse_policy.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/local_mouse_sdl.cpp
++    ${PSXRECOMP_ROOT}/runtime/src/ps_mouse_input.c
++    ${PSXRECOMP_ROOT}/runtime/src/ps_mouse_sdl.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/memory.c
+     ${PSXRECOMP_ROOT}/runtime/src/psx_ram_geometry.c
+     ${PSXRECOMP_ROOT}/runtime/src/kernel_patch_ranges.c
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index d601c9fd..eee4b666 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8339,15 +8339,18 @@ static void handle_pad_status(int id, const char *json)
+     uint16_t pad0 = sio_get_pad_buttons_slot(0);
+     uint16_t pad1 = sio_get_pad_buttons_slot(1);
+     uint8_t sticks0[4], sticks1[4], neg0[3], neg1[3];
++    int mouse0[2], mouse1[2];
++    sio_get_pad_mouse(0, &mouse0[0], &mouse0[1]);
++    sio_get_pad_mouse(1, &mouse1[0], &mouse1[1]);
+     sio_get_pad_sticks(0, sticks0);
+     sio_get_pad_sticks(1, sticks1);
+     sio_get_pad_negcon(0, neg0);
+     sio_get_pad_negcon(1, neg1);
+     send_fmt("{\"id\":%d,\"ok\":true,\"pad\":\"0x%04X\","
+              "\"slot0\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"type\":%d,\"sticks\":[%u,%u,%u,%u],"
+-             "\"negcon\":[%u,%u,%u],\"mode_locked\":%s},"
++             "\"negcon\":[%u,%u,%u],\"mode_locked\":%s,\"mouse_owed\":[%d,%d]},"
+              "\"slot1\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s,\"type\":%d,\"sticks\":[%u,%u,%u,%u],"
+-             "\"negcon\":[%u,%u,%u],\"mode_locked\":%s},"
++             "\"negcon\":[%u,%u,%u],\"mode_locked\":%s,\"mouse_owed\":[%d,%d]},"
+              "\"override\":%d,\"override_frames\":%d,\"override_pad_type\":%d,"
+              "\"override_p2\":%d,\"override_p2_frames\":%d,"
+              "\"override_axes\":[%u,%u,%u,%u],\"override_axes_valid\":%s,"
+@@ -8358,10 +8361,12 @@ static void handle_pad_status(int id, const char *json)
+              sio_get_pad_analog(0),
+              sticks0[0], sticks0[1], sticks0[2], sticks0[3],
+              neg0[0], neg0[1], neg0[2], sio_get_pad_mode_locked(0) ? "true" : "false",
++             mouse0[0], mouse0[1],
+              pad1, sio_get_pad_connected(1) ? "true" : "false", sio_get_pad_analog(1) ? "true" : "false",
+              sio_get_pad_analog(1),
+              sticks1[0], sticks1[1], sticks1[2], sticks1[3],
+              neg1[0], neg1[1], neg1[2], sio_get_pad_mode_locked(1) ? "true" : "false",
++             mouse1[0], mouse1[1],
+              s_input_override, s_input_frames, s_pad_type_override,
+              s_input_override_p2, s_input_frames_p2,
+              s_axis_st[0], s_axis_st[1], s_axis_st[2], s_axis_st[3],
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index f90e2001..0de9af94 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -44,6 +44,8 @@
+ #include "psx_savestate_menu.h"
+ #include "host_osd.h"
+ #include "local_mouse_sdl.h"
++#include "ps_mouse_input.h"
++#include "ps_mouse_sdl.h"
+ #include "pad_external_input.h"
+ #include "host_keymap.h"
+ #include "png_write.h"       /* png_write_rgb — present_shot readback */
+@@ -447,7 +449,7 @@ static SDL_Texture*  sdl_texture;
+  * [controller] settings the launcher writes; the runtime opens the matching
+  * SDL controller (or uses the keyboard) and feeds each PSX pad slot. */
+ struct PlayerInput {
+-    int   kind = 0;            /* 0=none, 1=keyboard, 2=controller */
++    int   kind = 0;            /* 0=none, 1=keyboard, 2=controller, 3=PS mouse */
+     char  guid[40] = {0};      /* SDL joystick GUID string when kind==controller */
+     /* Pad input mode (PSXRecompV4::PadMode): 1=analog (default), 2=digital.
+      * Game-owned plugins may register a trusted per-sample presentation policy
+@@ -475,6 +477,9 @@ static bool g_jogcon_ffb_invert = false;
+ static PlayerInput g_players[PSX_MAX_PLAYERS];
+ /* Offline SIO sample loop bound (from game.toml players; clamped). */
+ static int g_offline_pad_count = 2;
++/* game.toml [controller] supports_ps_mouse: offer "PlayStation Mouse" as
++ * Player 1's launcher source (docs/PS_MOUSE.md). */
++static bool g_ps_mouse_launcher_entry = false;
+ /* Set when [controller] lock_mode pins every seat to digital — blocks the
+  * DualShock-on-tap hack from settings.toml / Lobby Settings / match_caps. */
+ static int g_force_digital_pads = 0;
+@@ -1103,6 +1108,7 @@ extern "C" void psx_frontend_on_savestate_loaded(void) {
+     ++s_fmv_timeline_epoch;
+     psx_projection_reset_session();
+     psx_local_mouse_reset();
++    ps_mouse_input_reset();
+     mod_runtime_on_savestate_loaded();
+     dynres_note_savestate_loaded();
+ #ifndef PSX_NO_DEBUG_TOOLS
+@@ -4241,6 +4247,7 @@ static const char* netplay_start_failure(int nrc, const PsxNetplayConfig& cfg) {
+ 
+ static void shutdown_runtime(void) {
+     psx_local_mouse_clear();
++    psx_ps_mouse_release();
+     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
+      * off-thread JIT worker here; the worker no longer exists.) */
+     psx_netplay_shutdown();
+@@ -5890,6 +5897,7 @@ static int pad_mode_boot_analog(int mode) {
+ }
+ 
+ static int pad_type_boot(const PlayerInput& p, int mode) {
++    if (p.kind == 3) return SIO_PAD_MOUSE;
+     return p.steering_wheel ? SIO_PAD_JOGCON
+          : (pad_mode_boot_analog(mode) ? SIO_PAD_DUALSHOCK : SIO_PAD_DIGITAL);
+ }
+@@ -5897,6 +5905,8 @@ static int pad_type_boot(const PlayerInput& p, int mode) {
+ /* Boot/hotplug type for slot s: a registered title pad transform names the
+  * type it presents before its first frame; otherwise the device/mode type. */
+ static int pad_type_boot_for_slot(int s, const PlayerInput& p, int mode) {
++    /* A PlayStation Mouse port is the mouse; title transforms describe pads. */
++    if (p.kind == 3) return SIO_PAD_MOUSE;
+     const int initial = mod_pad_transform_initial_type((uint32_t)s);
+     return initial >= 0 ? initial : pad_type_boot(p, mode);
+ }
+@@ -5933,12 +5943,24 @@ static int assert_sio_pad_profile(int s, bool dev_here) {
+      * down the config path -> phantom 0x00 reads.
+      * Multitap taps are always digital (see sio_pad_on_multitap). */
+     sio_set_pad_config_capable(
+-        s, policy.callback ? policy.config_capable
+-                           : (p.steering_wheel ||
+-                              mode != PSXRecompV4::PAD_MODE_DIGITAL));
++        s, p.kind == 3 ? 0
++           : policy.callback ? policy.config_capable
++                             : (p.steering_wheel ||
++                                mode != PSXRecompV4::PAD_MODE_DIGITAL));
+     return boot_mode;
+ }
+ 
++/* The host mouse drives every port configured as a PlayStation Mouse
++ * (device "mouse"). It is an offline device: netplay never samples it. */
++static bool ps_mouse_port_for(const PlayerInput& p) { return p.kind == 3; }
++
++static void sync_ps_mouse_enabled(void) {
++    bool any = false;
++    for (int s = 0; s < PSX_MAX_PLAYERS; s++)
++        any = any || ps_mouse_port_for(g_players[s]);
++    psx_ps_mouse_set_enabled(any && !psx_netplay_active());
++}
++
+ /* Open/close SDL handles so they match g_players, and (re)assert each slot's
+  * PSX connection + pad type. Safe to call repeatedly (hotplug, boot).
+  * While delay-sync netplay is active, SIO connection/type are owned by
+@@ -5971,6 +5993,7 @@ static void refresh_player_devices(void) {
+             sio_set_pad_config_capable(s, 1);
+         sio_set_pad_type(s, boot_type, 0x80, 0x80, 0x80, 0x80);
+     }
++    sync_ps_mouse_enabled();
+ }
+ 
+ /* Parse a [controller] device string into a player slot:
+@@ -5981,6 +6004,10 @@ static void set_player_device(PlayerInput& p, const std::string& dev, int mode)
+     std::string d = lower_copy(trim_copy(dev));
+     if (d.empty() || d == "none") { p.kind = 0; }
+     else if (d == "keyboard")     { p.kind = 1; }
++    else if (PSXRecompV4::launcher_device_is_ps_mouse(d)) {
++        /* SCPH-1030 PlayStation Mouse driven by the host mouse. */
++        p.kind = 3;
++    }
+     else if (d == "auto" || d == "gamepad" || d == "controller") {
+         /* First available SDL game controller (guid empty -> open_player falls
+          * back to the first connected pad). Lets a user default to "my
+@@ -6471,6 +6498,7 @@ static void dev_any_controller_sticks(uint8_t st[4]) {
+ 
+ static void savestate_input_guard_arm(void) {
+     psx_local_mouse_reset();
++    ps_mouse_input_reset();
+     uint32_t now = (uint32_t)SDL_GetTicks();
+     g_savestate_input_guard_min_until = now + 90u;
+     g_savestate_input_guard_max_until = now + 700u;
+@@ -6761,6 +6789,20 @@ static int capture_pad_slot_view(int s, PsxNetPad* out, bool guarded,
+      * controller (PSX_DEV_INPUT=1). Default is strict per-slot routing. */
+     const bool dev_here = (dev_any_input_enabled() && s == 0);
+     if (p.kind == 0 && !dev_here) return 0;  /* no device in this port */
++    if (ps_mouse_port_for(p)) {
++        /* This frame's latched host mouse (sample_pad_into_sio latches it
++         * once); reading it here consumes nothing. Guarded or overlay-owned
++         * frames see a still mouse with no buttons. */
++        PsMouseFrame m;
++        if (guarded) ps_mouse_input_neutral(&m);
++        else ps_mouse_input_frame(&m);
++        out->buttons = m.buttons;
++        out->lx = (uint8_t)m.dx; out->ly = (uint8_t)m.dy;
++        out->rx = out->ry = 0x80u;
++        out->analog = (uint8_t)SIO_PAD_MOUSE;
++        out->connected = 1;
++        return 1;
++    }
+ 
+     /* Resolve the pad type this frame FIRST — the effective analog/digital
+      * state gates how the left stick is read for BOTH the button word and the
+@@ -6882,6 +6924,7 @@ static int capture_pad_slot_exclusive(int s, PsxNetPad* out, int present_sio_slo
+     const int  player  = s + 1;             /* keybinds.ini section (1..5) */
+     const bool dev_here = false;
+     if (p.kind == 0) return 0;  /* no device in this port */
++    if (ps_mouse_port_for(p)) return 0;  /* PlayStation Mouse: offline only */
+ 
+     /* Same predicate as capture_pad_slot, with dev-any-input disabled:
+      * netplay must stay exclusive so peers hash-agree. */
+@@ -7700,6 +7743,8 @@ static void sample_pad_into_sio(int override) {
+     if (n > PSX_MAX_PLAYERS) n = PSX_MAX_PLAYERS;
+     const uint32_t consumer_sim =
+         psx_start_consumer_enabled() ? psx_start_consumer_offline_frame() : 0u;
++    /* One host-mouse share per sample; every mouse port reads the same one. */
++    ps_mouse_input_latch();
+     PadExtHooks hooks = pad_ext_main_hooks();
+     for (int s = 0; s < n; s++) {
+         PsxNetPad pad;
+@@ -8560,6 +8605,7 @@ static void runtime_menu_host_loop(void) {
+     if (!psx_runtime_menu_is_open()) return;
+     psx_local_mouse_begin(sdl_window, false);
+     psx_local_mouse_reset();
++    psx_ps_mouse_release();
+     freeze_heartbeat_set_paused(1);
+     psx_sdl_audio_set_paused(sdl_audio_device, 1);
+     const int buttons[] = { SDL_CONTROLLER_BUTTON_B, SDL_CONTROLLER_BUTTON_DPAD_UP,
+@@ -8628,6 +8674,7 @@ static void rewind_host_pause_loop(void) {
+     jogcon_ffb_neutral_all();   /* the wheel goes slack while paused */
+     psx_local_mouse_begin(sdl_window, false);
+     psx_local_mouse_reset();
++    psx_ps_mouse_release();
+     freeze_heartbeat_set_paused(1);
+     while (psx_rewind_is_open()) {
+ #ifndef PSX_NO_DEBUG_TOOLS
+@@ -8696,6 +8743,7 @@ static bool host_pause_event(const SDL_Event& ev) {
+ static void host_pause_loop(void) {
+     psx_local_mouse_begin(sdl_window, false);
+     psx_local_mouse_reset();
++    psx_ps_mouse_release();
+     freeze_heartbeat_set_paused(1);
+     psx_sdl_audio_set_paused(sdl_audio_device, 1);
+     while (psx_host_pause_depth() > 0) {
+@@ -8819,6 +8867,7 @@ static void savestate_menu_host_pause_loop(void) {
+     jogcon_ffb_neutral_all();   /* the wheel goes slack while paused */
+     psx_local_mouse_begin(sdl_window, false);
+     psx_local_mouse_reset();
++    psx_ps_mouse_release();
+     freeze_heartbeat_set_paused(1);
+     while (savestate_menu_open) {
+         SDL_Event ev;
+@@ -8975,6 +9024,7 @@ static void recover_disconnected_controllers() {
+ static bool drain_host_events() {
+     SDL_Event ev;
+     while (SDL_PollEvent(&ev)) {
++        if (psx_ps_mouse_event(ev)) continue;
+         if (psx_local_mouse_event(ev)) continue;
+         /* In-game overlay provider sees events first (host_overlay.h P3). */
+         if (psx_host_input_sink_dispatch(&ev)) continue;
+@@ -9180,6 +9230,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     host_frame_stamp((uint32_t)s_frame_count, (uint32_t)g_dirty_ram_insns_run, stamp_static_checks);
+ 
+     psx_local_mouse_begin(sdl_window, local_mouse_live(override));
++    psx_ps_mouse_begin(sdl_window, local_mouse_live(override));
+     {
+         /* Outside every debug guard on purpose: production must be measurable. */
+         extern uint64_t s_frame_count;
+@@ -9338,6 +9389,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+     if (!g_headless) {
+         /* Pump SDL events to prevent window freeze. */
+         psx_local_mouse_begin(sdl_window, local_mouse_live(override));
++        psx_ps_mouse_begin(sdl_window, local_mouse_live(override));
+         if (!drain_host_events()) return ep;
+         host_pause_service();
+         runtime_menu_poll_toggle();
+@@ -9757,8 +9809,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+          * semantics) — the mid-frame re-sample would fork the resim. */
+         if (g_low_latency_input && !psx_selfcheck_input_locked()) {
+             SDL_GameControllerUpdate();  /* refresh pad state after the wait */
+-            if (psx_local_mouse_installed()) {
++            if (psx_local_mouse_installed() || psx_ps_mouse_enabled()) {
+                 psx_local_mouse_begin(sdl_window, local_mouse_live(override));
++                psx_ps_mouse_begin(sdl_window, local_mouse_live(override));
+                 if (!drain_host_events()) return ep;
+                 /* The overlay may have opened during the pacer wait (its
+                  * Start+Select chord): settle ui_capture before the pad
+@@ -9769,6 +9822,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+                 if (psx_rewind_is_open()) rewind_host_pause_loop();
+                 if (psx_host_pause_depth() > 0) host_pause_loop();
+                 psx_local_mouse_begin(sdl_window, local_mouse_live(override));
++                psx_ps_mouse_begin(sdl_window, local_mouse_live(override));
+             } else {
+                 SDL_PumpEvents(); // retain native timing when no policy exists
+             }
+@@ -16717,6 +16771,39 @@ namespace {
+         g_rui_config_ini_path = (exe / "config.ini").string();
+     }
+ 
++    /* Player 1's "PlayStation Mouse" source entry: recomp-ui's mouse source
++     * as a host-emulated device (no mouse-aim card or defaults), only for a
++     * title that declares supports_ps_mouse. */
++    static void psx_launcher_offer_ps_mouse(RecompLauncherCGameInfo* gi) {
++#if defined(RECOMP_LAUNCHER_HAS_MOUSE_SOURCE)
++        if (!gi || !g_ps_mouse_launcher_entry) return;
++        gi->has_mouse_controls = 1;
++        gi->mouse_source_label = "PlayStation Mouse";
++        gi->mouse_source_only = 1;
++#else
++        (void)gi;
++#endif
++    }
++
++    /* Whether this launcher shows that entry, and the player's choice in it.
++     * An older recomp-ui has neither: the mouse is then settings.toml only. */
++    bool launcher_ps_mouse_entry() {
++#if defined(RECOMP_LAUNCHER_HAS_MOUSE_SOURCE)
++        return g_ps_mouse_launcher_entry;
++#else
++        return false;
++#endif
++    }
++
++    int launcher_mouse_enabled(const RecompLauncherCSettings& ls) {
++#if defined(RECOMP_LAUNCHER_HAS_MOUSE_SOURCE)
++        return ls.mouse_enabled;
++#else
++        (void)ls;
++        return 0;
++#endif
++    }
++
+     void ae_fill_psx_launcher_game_info(
+         RecompLauncherCGameInfo* gi,
+         const char* game_name_c,
+@@ -16773,6 +16860,7 @@ namespace {
+         gi->pad_mode_selectable = ctrl_lock_mode_b ? 0 : 1;
+         gi->locked_pad_mode = locked_pad_mode_i;
+         gi->lock_device = ctrl_lock_device_b ? 1 : 0;
++        psx_launcher_offer_ps_mouse(gi);
+         gi->aspect_mask = 0;
+         gi->renderer_labels = kPsxRendererLabels;
+         gi->num_renderers = vulkan_offered_b ? 3 : 2;
+@@ -17138,9 +17226,14 @@ void mh_launcher_settings_get(RecompLauncherCSettings* out) {
+     ls.jogcon_force_feedback = psx_jogcon_ffb_player_enabled();
+ #endif
+     for (int i = 0; i < PSX_MAX_PLAYERS && i < RECOMP_LAUNCHER_MAX_PLAYERS; ++i) {
+-        ls.player_src[i] = g_players[i].kind;
++        /* recomp-ui knows None/Keyboard/Gamepad; a PlayStation Mouse port
++         * shows as Keyboard (launcher_source_from_device). */
++        ls.player_src[i] = ps_mouse_port_for(g_players[i]) ? 1 : g_players[i].kind;
+         ls.pad_mode[i] = PSXRecompV4::PAD_MODE_ANALOG;
+     }
++#if defined(RECOMP_LAUNCHER_HAS_MOUSE_SOURCE)
++    ls.mouse_enabled = ps_mouse_port_for(g_players[0]) ? 1 : 0;
++#endif
+ }
+ unsigned mh_launcher_settings_apply(const RecompLauncherCSettings* s) {
+     if (!s) return 0;
+@@ -17157,6 +17250,7 @@ void mh_launcher_game_info(RecompLauncherCGameInfo* out) {
+     RecompLauncherCGameInfo& gi = *out;
+     launcher_profile_apply("psx", &gi);
+     psx_launcher_hide_mod_owned_rows(&gi);
++    psx_launcher_offer_ps_mouse(&gi);
+     gi.name = g_ovl_name.c_str();
+     gi.keybinds_path = g_ovl_keybinds.c_str();
+     gi.config_path = g_ovl_config.c_str();
+@@ -18337,6 +18431,7 @@ int main(int argc, char** argv) {
+                 ctrl_locked_mode[i] = player_mode[i];
+             ctrl_lock_mode    = gc.runtime.controller_lock_mode;
+             ctrl_lock_device  = gc.runtime.controller_lock_device;
++            g_ps_mouse_launcher_entry = gc.runtime.controller_supports_ps_mouse;
+             if (gc.runtime.has_deadzone) {
+                 resolved_deadzone = gc.runtime.deadzone;
+                 for (int i = 0; i < PSX_MAX_PLAYERS; ++i)
+@@ -19296,6 +19391,11 @@ int main(int argc, char** argv) {
+                     const std::string& d = player_device[i];
+                     ls.player_src[i] =
+                         PSXRecompV4::launcher_source_from_device(d);
++#if defined(RECOMP_LAUNCHER_HAS_MOUSE_SOURCE)
++                    if (i == 0)
++                        ls.mouse_enabled =
++                            PSXRecompV4::launcher_mouse_enabled_from_device(d);
++#endif
+                     /* Round to the nearest launcher percent. Truncation turned a
+                      * saved 20% value (6553/32767) into 19%, which the launcher's
+                      * 5% normalization then silently reduced to 15%. */
+@@ -19633,7 +19733,11 @@ int main(int argc, char** argv) {
+                             ? ls.player_gamepad_instance[i] : 0;
+ #endif
+                         if (ls.player_src[i] == 1) {
+-                            player_device[i] = "keyboard";
++                            /* Player 1: the PlayStation Mouse entry when offered; otherwise
++                             * Keyboard keeps a mouse seat configured in settings.toml. */
++                            player_device[i] = PSXRecompV4::launcher_keyboard_device(
++                                i == 0 && launcher_ps_mouse_entry(), launcher_mouse_enabled(ls),
++                                player_device[i]);
+                         } else if (ls.player_src[i] == 0) {
+                             player_device[i] = "none";
+                         } else if (ls.player_gamepad_guid[i][0]) {
+@@ -20620,6 +20724,11 @@ session_reboot:
+             const bool dev_p1 = (dev_any_input_enabled() && s == 0);
+             const int mode = effective_player_mode_for_sio(g_players[s], s);
+             sio_set_pad_connected(s, (g_players[s].kind != 0 || dev_p1) ? 1 : 0);
++            if (ps_mouse_port_for(g_players[s])) {
++                sio_set_pad_type(s, SIO_PAD_MOUSE, 0x80, 0x80, 0x80, 0x80);
++                sio_set_pad_config_capable(s, 0);
++                continue;
++            }
+             sio_set_pad_analog(s, pad_mode_boot_analog(mode), 0x80, 0x80, 0x80, 0x80);
+             sio_set_pad_config_capable(s, mode != PSXRecompV4::PAD_MODE_DIGITAL);
+         }
+@@ -22006,6 +22115,11 @@ soft_return_lobby:
+                 const std::string& d = player_device[i];
+                 ls.player_src[i] =
+                     PSXRecompV4::launcher_source_from_device(d);
++#if defined(RECOMP_LAUNCHER_HAS_MOUSE_SOURCE)
++                if (i == 0)
++                    ls.mouse_enabled =
++                        PSXRecompV4::launcher_mouse_enabled_from_device(d);
++#endif
+                 ls.deadzone[i] =
+                     (player_deadzone[i] * 100 + 32767 / 2) / 32767;
+                 /* Verbatim, as in the first launcher entry above. */
+@@ -22188,7 +22302,11 @@ soft_return_lobby:
+                         ? ls.player_gamepad_instance[i] : 0;
+ #endif
+                     if (ls.player_src[i] == 1) {
+-                        player_device[i] = "keyboard";
++                        /* Player 1: the PlayStation Mouse entry when offered; otherwise
++                         * Keyboard keeps a mouse seat configured in settings.toml. */
++                        player_device[i] = PSXRecompV4::launcher_keyboard_device(
++                            i == 0 && launcher_ps_mouse_entry(), launcher_mouse_enabled(ls),
++                            player_device[i]);
+                     } else if (ls.player_src[i] == 0) {
+                         player_device[i] = "none";
+                     } else if (ls.player_gamepad_guid[i][0]) {
+diff --git a/runtime/src/pad_external_input.c b/runtime/src/pad_external_input.c
+index d0e30edc..e7920768 100644
+--- a/runtime/src/pad_external_input.c
++++ b/runtime/src/pad_external_input.c
+@@ -1,5 +1,6 @@
+ #include <string.h>
+ #include "pad_external_input.h"
++#include "sio.h"
+ 
+ int pad_ext_live(const PadExtGate *g) {
+     return g && !g->injected_input && !g->headless && !g->netplay_active &&
+@@ -15,6 +16,8 @@ static void pad_ext_transform(const PadExtHooks *h, int s, int guarded,
+     PSXModPadFrame f;
+     PSXModPadOutput stock, o;
+     if (!h->pad_transform) return;
++    /* A PlayStation Mouse is not a pad the transform contract describes. */
++    if (out->analog == SIO_PAD_MOUSE) return;
+     memset(&stock, 0, sizeof stock);
+     stock.struct_size = sizeof stock;
+     stock.buttons = out->buttons;
+@@ -86,7 +89,10 @@ int pad_ext_resolve(const PadExtHooks *h, int s, PsxNetPad *out) {
+     }
+     pad_ext_transform(h, s, guarded, has_source, out);
+     if (s == 0) {
+-        if (guarded || out->analog == PSX_MOD_PAD_NEGCON) h->mouse_reset(h->ctx);
++        /* NeGcon pressure and PlayStation Mouse motion are not a right stick. */
++        if (guarded || out->analog == PSX_MOD_PAD_NEGCON ||
++            out->analog == SIO_PAD_MOUSE)
++            h->mouse_reset(h->ctx);
+         else h->mouse_fold(h->ctx, out->connected, out->analog, out->buttons,
+                            &out->rx, &out->ry);
+     }
+diff --git a/runtime/src/pad_external_input.h b/runtime/src/pad_external_input.h
+index 9679f9cd..6b59444f 100644
+--- a/runtime/src/pad_external_input.h
++++ b/runtime/src/pad_external_input.h
+@@ -13,7 +13,8 @@
+  *         documents). Declining delivers the stock pad of (1)/(2).
+  *   (3) local mouse policy (psx_mod_set_local_mouse_policy), P1 only: may
+  *         override ONLY the right analog axes of whatever (1)-(2b) produced;
+- *         a NeGcon result has no right stick, so it resets the mouse.
++ *         a NeGcon or PlayStation Mouse result has no right stick, so it
++ *         resets the mouse policy. A PlayStation Mouse port also skips (2b).
+  *
+  * Precedence: a source never suppresses the mouse policy. The mouse sees the
+  * RESOLVED pad (final buttons, final analog flag, final right stick), so a
+diff --git a/runtime/src/ps_mouse_input.c b/runtime/src/ps_mouse_input.c
+new file mode 100644
+index 00000000..dc99c07b
+--- /dev/null
++++ b/runtime/src/ps_mouse_input.c
+@@ -0,0 +1,72 @@
++#include "ps_mouse_input.h"
++#include "sio.h"
++
++/* Bound on owed motion: 30 frames of full-speed travel, the same window the
++ * SIO device keeps (Mednafen mouse.cpp). Anything beyond is a stall, not aim. */
++#define PS_MOUSE_OWED_MAX (30.0f * 128.0f)
++
++static float s_dx, s_dy;
++static uint8_t s_held, s_pressed;
++static PsMouseFrame s_frame = { 0, 0, 0xFFFFu };
++
++static float owed_clamp(float v) {
++    if (v > PS_MOUSE_OWED_MAX) return PS_MOUSE_OWED_MAX;
++    if (v < -PS_MOUSE_OWED_MAX) return -PS_MOUSE_OWED_MAX;
++    return v;
++}
++
++/* Whole units toward zero, clipped to a signed byte; the remainder stays. */
++static int8_t take(float *owed) {
++    int v = (int)*owed;
++    if (v > 127) v = 127;
++    if (v < -128) v = -128;
++    *owed -= (float)v;
++    return (int8_t)v;
++}
++
++static uint16_t button_word(uint8_t pressed) {
++    uint16_t w = 0xFFFFu;
++    if (pressed & PS_MOUSE_LEFT) w &= (uint16_t)~SIO_MOUSE_BTN_LEFT;
++    if (pressed & PS_MOUSE_RIGHT) w &= (uint16_t)~SIO_MOUSE_BTN_RIGHT;
++    return w;
++}
++
++void ps_mouse_input_neutral(PsMouseFrame *out) {
++    if (!out) return;
++    out->dx = out->dy = 0;
++    out->buttons = 0xFFFFu;
++}
++
++void ps_mouse_input_reset(void) {
++    s_dx = s_dy = 0.0f;
++    s_held = s_pressed = 0;
++    ps_mouse_input_neutral(&s_frame);
++}
++
++void ps_mouse_input_motion(float dx, float dy) {
++    /* NaN fails both comparisons in owed_clamp; drop it here instead. */
++    if (dx != dx || dy != dy) return;
++    s_dx = owed_clamp(s_dx + dx);
++    s_dy = owed_clamp(s_dy + dy);
++}
++
++void ps_mouse_input_button(int button, int down) {
++    const uint8_t bit = (uint8_t)(button & (PS_MOUSE_LEFT | PS_MOUSE_RIGHT));
++    if (down) {
++        s_held |= bit;
++        s_pressed |= bit;
++    } else {
++        s_held &= (uint8_t)~bit;
++    }
++}
++
++void ps_mouse_input_latch(void) {
++    s_frame.dx = take(&s_dx);
++    s_frame.dy = take(&s_dy);
++    s_frame.buttons = button_word((uint8_t)(s_held | s_pressed));
++    s_pressed = 0;
++}
++
++void ps_mouse_input_frame(PsMouseFrame *out) {
++    if (out) *out = s_frame;
++}
+diff --git a/runtime/src/ps_mouse_input.h b/runtime/src/ps_mouse_input.h
+new file mode 100644
+index 00000000..fbf2bd46
+--- /dev/null
++++ b/runtime/src/ps_mouse_input.h
+@@ -0,0 +1,39 @@
++#pragma once
++/* Host side of the emulated PlayStation Mouse (SIO_PAD_MOUSE): the PC mouse's
++ * relative motion and two buttons, collected from SDL events and handed to the
++ * guest once per sampled frame through PsxNetPad -> psx_pad_apply_to_sio.
++ *
++ * Motion is summed with its fractional part; each latch moves at most one
++ * signed byte per axis into the frame and keeps the rest for later frames, so
++ * a fast flick is spread over frames instead of being clipped away (the SIO
++ * device then spreads it over polls the same way). A button pressed and
++ * released between two latches still shows as pressed in the next frame.
++ *
++ * Pure: no SDL, no SIO. Owned by the SDL/main thread. */
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct PsMouseFrame {
++    int8_t   dx, dy;   /* +X right, +Y down, PlayStation Mouse units */
++    uint16_t buttons;  /* SIO_MOUSE_BTN_* active low, other bits set */
++} PsMouseFrame;
++
++enum { PS_MOUSE_LEFT = 0x01, PS_MOUSE_RIGHT = 0x02 };
++
++/* Forget owed motion, latched clicks and held buttons (capture release,
++ * reset, state load, device change). */
++void ps_mouse_input_reset(void);
++void ps_mouse_input_motion(float dx, float dy);
++void ps_mouse_input_button(int button, int down);
++/* Once per sampled frame: move this frame's share into the latched frame. */
++void ps_mouse_input_latch(void);
++/* The latched frame; reading does not consume it. */
++void ps_mouse_input_frame(PsMouseFrame *out);
++/* Neutral frame (no motion, no buttons). */
++void ps_mouse_input_neutral(PsMouseFrame *out);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/runtime/src/ps_mouse_sdl.cpp b/runtime/src/ps_mouse_sdl.cpp
+new file mode 100644
+index 00000000..7449602c
+--- /dev/null
++++ b/runtime/src/ps_mouse_sdl.cpp
+@@ -0,0 +1,140 @@
++#include "ps_mouse_sdl.h"
++#include "ps_mouse_input.h"
++#include "host_osd.h"
++
++namespace {
++SDL_Window* window_ = nullptr;
++bool enabled_ = false;
++bool live_ = false;
++bool captured_ = false;
++bool hinted_ = false;
++
++bool set_relative(bool on) {
++    if (!window_) return !on;
++#if defined(PSX_SDL3)
++    return SDL_SetWindowRelativeMouseMode(window_, on);
++#else
++    return SDL_SetRelativeMouseMode(on ? SDL_TRUE : SDL_FALSE) == 0;
++#endif
++}
++
++bool focused() {
++    if (!window_ || SDL_GetKeyboardFocus() != window_) return false;
++    const auto flags = SDL_GetWindowFlags(window_);
++    return (flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)) == 0;
++}
++
++bool our_window(Uint32 window_id) {
++    return window_ && window_id == SDL_GetWindowID(window_);
++}
++
++void acquire() {
++    if (!set_relative(true)) {
++        host_osd_push("PlayStation Mouse: the mouse could not be captured", 2000);
++        return;
++    }
++    captured_ = true;
++    ps_mouse_input_reset();
++    host_osd_push("PlayStation Mouse captured (Esc releases)", 1500);
++}
++
++int ps_button(Uint8 sdl_button) {
++    if (sdl_button == SDL_BUTTON_LEFT) return PS_MOUSE_LEFT;
++    if (sdl_button == SDL_BUTTON_RIGHT) return PS_MOUSE_RIGHT;
++    return 0;
++}
++} // namespace
++
++void psx_ps_mouse_release() {
++    if (captured_) set_relative(false);
++    captured_ = false;
++    ps_mouse_input_reset();
++}
++
++void psx_ps_mouse_set_enabled(bool enabled) {
++    if (!enabled) psx_ps_mouse_release();
++    enabled_ = enabled;
++    if (!enabled) hinted_ = false;
++}
++
++bool psx_ps_mouse_enabled() { return enabled_; }
++bool psx_ps_mouse_captured() { return captured_; }
++
++void psx_ps_mouse_begin(SDL_Window* window, bool live) {
++    if (!enabled_) return;
++    if (window_ && window_ != window) psx_ps_mouse_release();
++    window_ = window;
++    live_ = live;
++    if (captured_ && (!live_ || !focused())) psx_ps_mouse_release();
++    if (live_ && !hinted_ && window_) {
++        hinted_ = true;
++        host_osd_push("PlayStation Mouse: click in the window to capture", 3000);
++    }
++}
++
++bool psx_ps_mouse_event(const SDL_Event& ev) {
++    if (!enabled_) return false;
++#if defined(PSX_SDL3)
++    if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST || ev.type == SDL_EVENT_WINDOW_HIDDEN ||
++        ev.type == SDL_EVENT_WINDOW_MINIMIZED) {
++        if (our_window(ev.window.windowID)) psx_ps_mouse_release();
++        return false;
++    }
++    if (ev.type == SDL_EVENT_MOUSE_REMOVED) {
++        psx_ps_mouse_release();
++        return false;
++    }
++#else
++    if (ev.type == SDL_WINDOWEVENT && our_window(ev.window.windowID) &&
++        (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
++         ev.window.event == SDL_WINDOWEVENT_HIDDEN ||
++         ev.window.event == SDL_WINDOWEVENT_MINIMIZED)) {
++        psx_ps_mouse_release();
++        return false;
++    }
++#endif
++    if (ev.type == SDL_MOUSEMOTION) {
++        if (!captured_ || ev.motion.which == SDL_TOUCH_MOUSEID) return false;
++#if defined(PSX_SDL3)
++        if (ev.motion.which == SDL_PEN_MOUSEID) return false;
++#endif
++        ps_mouse_input_motion((float)ev.motion.xrel, (float)ev.motion.yrel);
++        return true;
++    }
++    if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP) {
++        if (ev.button.which == SDL_TOUCH_MOUSEID) return false;
++#if defined(PSX_SDL3)
++        if (ev.button.which == SDL_PEN_MOUSEID) return false;
++#endif
++        const bool down = ev.type == SDL_MOUSEBUTTONDOWN;
++        if (!captured_) {
++            // Only a fresh left click in the focused game window, on a live
++            // frame, acquires. The acquiring click is not a guest click.
++            if (down && live_ && ev.button.button == SDL_BUTTON_LEFT &&
++                our_window(ev.button.windowID) && focused()) {
++                acquire();
++                return captured_;
++            }
++            return false;
++        }
++        // The release of a button pressed before capture reports "up" for a
++        // button the guest never saw down; that is harmless.
++        if (const int b = ps_button(ev.button.button)) ps_mouse_input_button(b, down);
++        return true;
++    }
++    if (captured_ && (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP)) {
++#if defined(PSX_SDL3)
++        const auto sc = ev.key.scancode;
++#else
++        const auto sc = ev.key.keysym.scancode;
++#endif
++        if (sc == SDL_SCANCODE_ESCAPE) {
++            if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
++                psx_ps_mouse_release();
++                host_osd_push("PlayStation Mouse released", 1200);
++            }
++            return true;
++        }
++    }
++    return false;
++}
+diff --git a/runtime/src/ps_mouse_sdl.h b/runtime/src/ps_mouse_sdl.h
+new file mode 100644
+index 00000000..8aef27b7
+--- /dev/null
++++ b/runtime/src/ps_mouse_sdl.h
+@@ -0,0 +1,25 @@
++#pragma once
++#include "psx_sdl.h"
++
++/* SDL adapter for the emulated PlayStation Mouse (ps_mouse_input.h).
++ *
++ * Inert unless a controller port is configured as the mouse
++ * (psx_ps_mouse_set_enabled). Then a left click in the game window captures
++ * the host mouse in relative mode; that click is not passed to the guest.
++ * While captured, motion and the left/right buttons drive the PlayStation
++ * Mouse and are not seen by other mouse consumers. Escape, focus loss,
++ * hide/minimize, mouse removal and any frame that is not live (menus, rewind,
++ * save-state guard, netplay, injected input, headless) release the capture
++ * and drop owed motion and buttons.
++ *
++ * All calls belong to the SDL owner thread. */
++void psx_ps_mouse_set_enabled(bool enabled);
++bool psx_ps_mouse_enabled();
++bool psx_ps_mouse_captured();
++/* Per frame, before draining events: `live` is the same gate the local
++ * mouse policy uses. Not live, unfocused or hidden releases the capture. */
++void psx_ps_mouse_begin(SDL_Window* window, bool live);
++/* Returns true when the event was consumed by the PlayStation Mouse. */
++bool psx_ps_mouse_event(const SDL_Event& event);
++/* Release the capture (if any) and drop owed motion and buttons. */
++void psx_ps_mouse_release();
+diff --git a/runtime/src/psx_pad_apply.c b/runtime/src/psx_pad_apply.c
+index cf9524dc..6b0b505d 100644
+--- a/runtime/src/psx_pad_apply.c
++++ b/runtime/src/psx_pad_apply.c
+@@ -8,6 +8,16 @@ void psx_pad_apply_to_sio(int port, const PsxNetPad *pad)
+     if (sio_pad_on_multitap(port) && !sio_get_multitap_analog())
+         sio_set_pad_config_capable(port, 0);
+     sio_set_pad_state_slot(port, pad->buttons);
++    if (pad->analog == SIO_PAD_MOUSE) {
++        /* Local-only type (never on the netplay wire, hence not under
++         * PSX_NETPAD_TYPE_MAX). The type request lands at the next idle bus
++         * boundary; motion sent before it is a mouse is dropped by SIO. */
++        sio_set_pad_sticks(port, 0x80, 0x80, 0x80, 0x80);
++        sio_set_pad_negcon(port, 0, 0, 0);
++        sio_request_pad_type(port, SIO_PAD_MOUSE);
++        sio_set_pad_mouse(port, (int8_t)pad->lx, (int8_t)pad->ly, pad->buttons);
++        return;
++    }
+     if (pad->analog == SIO_PAD_NEGCON) {
+         sio_set_pad_sticks(port, pad->lx, 0x80, 0x80, 0x80);
+         sio_set_pad_negcon(port, pad->rx, pad->ry, pad->ly);
+diff --git a/runtime/src/sio.c b/runtime/src/sio.c
+index e85f8b46..bf00893f 100644
+--- a/runtime/src/sio.c
++++ b/runtime/src/sio.c
+@@ -24,6 +24,8 @@
+ extern uint32_t i_stat;
+ /* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+ extern void psx_irq_raise(uint32_t bit, uint32_t detail);
++/* Guest cycle clock (psx_cycles.h); paces the mouse's stale-motion clear. */
++extern uint64_t psx_get_cycle_count(void);
+ 
+ /* IRQ bit for SIO0 */
+ #define IRQ_SIO0 7
+@@ -58,6 +60,22 @@ static uint8_t pad_stick[PSX_MAX_PLAYERS][4] = {
+  * Host input like the sticks: refreshed before each guest poll, not device
+  * state, so it is not part of the snapshot. */
+ static PSX_BSS uint8_t pad_negcon_analog[PSX_MAX_PLAYERS][3];
++/* PlayStation Mouse device state, modelled on Mednafen psx/input/mouse.cpp.
++ * Motion accumulates between polls; each 0x42 sends at most one signed byte
++ * per axis and keeps the remainder for the next poll. pad_mouse_held is the
++ * current button state (bit 0 right, bit 1 left) and pad_mouse_btn every button
++ * pressed since the previous poll; a poll reports both, so a click shorter than
++ * a poll interval is reported once and a release shows on the next poll
++ * (Mednafen's latch reports a release one poll late). Without a poll for MOUSE_CLEAR_CYCLES the
++ * device drops stale motion and latched clicks. Guest-visible: snapshotted. */
++#define MOUSE_ACCUM_MAX (30 * 127)
++#define MOUSE_ACCUM_MIN (30 * -128)
++#define MOUSE_CLEAR_CYCLES (33868800u / 4u)
++static PSX_BSS int16_t pad_mouse_dx[PSX_MAX_PLAYERS];
++static PSX_BSS int16_t pad_mouse_dy[PSX_MAX_PLAYERS];
++static PSX_BSS uint8_t pad_mouse_btn[PSX_MAX_PLAYERS];
++static PSX_BSS uint8_t pad_mouse_held[PSX_MAX_PLAYERS];
++static PSX_BSS uint64_t pad_mouse_clear_ref[PSX_MAX_PLAYERS];
+ /* The analog-capable device behind a config-mode pad: SIO_PAD_DUALSHOCK or
+  * SIO_PAD_JOGCON. Command 0x44 switches that device between its analog mode
+  * and digital mode (0x41); remembering the device keeps a JogCon that the game
+@@ -270,10 +288,40 @@ static uint8_t pad_protocol_id(int logical) {
+     if (pad_in_config[logical]) return 0xF3;
+     if (pad_analog[logical] == SIO_PAD_JOGCON) return 0xE3;
+     if (pad_analog[logical] == SIO_PAD_NEGCON) return 0x23;
++    if (pad_analog[logical] == SIO_PAD_MOUSE) return 0x12;
+     if (pad_analog[logical] == SIO_PAD_DUALSHOCK) return 0x73;
+     return 0x41;
+ }
+ 
++static void pad_mouse_clear(int logical) {
++    pad_mouse_dx[logical] = 0;
++    pad_mouse_dy[logical] = 0;
++    pad_mouse_btn[logical] = 0;
++    pad_mouse_held[logical] = 0;
++    pad_mouse_clear_ref[logical] = 0;
++}
++
++static int8_t pad_mouse_take(int16_t *accum) {
++    const int v = *accum < -128 ? -128 : (*accum > 127 ? 127 : *accum);
++    *accum = (int16_t)(*accum - v);
++    return (int8_t)v;
++}
++
++/* PlayStation Mouse 0x42 payload: ID 5A12h, buttons, then signed X and Y
++ * motion (PSX-SPX "Mouse"). Builds the frame the moment the command byte
++ * arrives and consumes what it reports, as Mednafen mouse.cpp does. */
++static void pad_fill_mouse_poll(int logical, uint8_t out[6]) {
++    out[0] = 0x12;
++    out[1] = 0x5A;
++    out[2] = 0xFF;
++    out[3] = (uint8_t)(0xFCu ^
++        ((unsigned)(pad_mouse_btn[logical] | pad_mouse_held[logical]) << 2));
++    out[4] = (uint8_t)pad_mouse_take(&pad_mouse_dx[logical]);
++    out[5] = (uint8_t)pad_mouse_take(&pad_mouse_dy[logical]);
++    pad_mouse_btn[logical] = 0;
++    pad_mouse_clear_ref[logical] = psx_get_cycle_count();
++}
++
+ /* NeGcon (NPC-101) poll payload: buttons, twist, then analog I, II and L
+  * (PSX-SPX controllersandmemorycards, "neGcon Racing Controller").
+  * The device has no config mode and no motors; every byte is fixed by the
+@@ -862,6 +910,7 @@ void sio_init(void) {
+     memset(pad_jogcon_motor_strength, 0, sizeof(pad_jogcon_motor_strength));
+     memset(pad_negcon_analog, 0, sizeof(pad_negcon_analog));
+     for (int i = 0; i < PSX_MAX_PLAYERS; i++) {
++        pad_mouse_clear(i);
+         pad_analog_device[i] = SIO_PAD_DUALSHOCK;
+         pad_buttons[i] = 0xFFFF;
+         pad_analog[i] = 0;
+@@ -937,6 +986,11 @@ void sio_set_multitap(int enabled) {
+         mtap_req_this[0] = mtap_req_this[1] = 0;
+         mtap_returned[0] = mtap_returned[1] = MTAP_NEXT_SLOT_A;
+     }
++    /* A mouse cannot sit on a tap seat (see pad_type_for_slot). */
++    for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
++        if (pad_analog[s] == SIO_PAD_MOUSE && sio_pad_on_multitap(s))
++            sio_request_pad_type(s, SIO_PAD_DIGITAL);
++    }
+ #else
+     (void)enabled;
+     sio_multitap_enabled = 0;
+@@ -1068,6 +1122,7 @@ void sio_set_pad_connected(int slot, int connected) {
+         pad_jogcon_last_steering[slot] = 0;
+         pad_jogcon_motor_command[slot] = 0;
+         pad_jogcon_motor_strength[slot] = 0;
++        pad_mouse_clear(slot);
+     }
+ }
+ 
+@@ -1119,9 +1174,26 @@ void sio_set_pad_state_slot(int slot, uint16_t buttons) {
+  * lock and the rumble map/motors exactly as unplugging one pad and plugging in
+  * another would. A game-locked analog mode therefore never pins a DualShock in
+  * place of a requested NeGcon (the lock belongs to the device that left), and a
+- * DualShock that returns powers up unlocked with an unassigned motor map. */
++ * DualShock that returns powers up unlocked with an unassigned motor map.
++ * The PlayStation Mouse is a device of its own in the same sense: no config
++ * mode, no motors, and the motion it owed belongs to the mouse that left. */
++static int pad_device_class(uint8_t type) {
++    if (type == SIO_PAD_NEGCON || type == SIO_PAD_MOUSE) return type;
++    return SIO_PAD_DUALSHOCK; /* digital / DualShock / JogCon: one 0x44 device */
++}
++
+ static int pad_type_is_device_swap(uint8_t from, uint8_t to) {
+-    return (from == SIO_PAD_NEGCON) != (to == SIO_PAD_NEGCON);
++    return pad_device_class(from) != pad_device_class(to);
++}
++
++/* A multitap bulk frame carries 8-byte pad blocks; no reference documents how
++ * a 6-byte mouse appears there, so a tap seat presents a digital pad instead. */
++static int pad_type_for_slot(int slot, int type) {
++    if (type < SIO_PAD_DIGITAL || type > SIO_PAD_MOUSE)
++        return SIO_PAD_DIGITAL;
++    if (type == SIO_PAD_MOUSE && sio_pad_on_multitap(slot))
++        return SIO_PAD_DIGITAL;
++    return type;
+ }
+ 
+ static void pad_commit_type(int slot, uint8_t type) {
+@@ -1137,6 +1209,7 @@ static void pad_commit_type(int slot, uint8_t type) {
+         memset(pad_rumble_map[slot], 0xFF, sizeof(pad_rumble_map[slot]));
+         pad_rumble_small[slot] = 0;
+         pad_rumble_large[slot] = 0;
++        pad_mouse_clear(slot);
+     }
+     if (type == SIO_PAD_DUALSHOCK || type == SIO_PAD_JOGCON)
+         pad_analog_device[slot] = type;
+@@ -1155,8 +1228,7 @@ void sio_set_pad_type(int slot, int type,
+         type = SIO_PAD_DIGITAL;
+         lx = ly = rx = ry = 0x80;
+     }
+-    if (type < SIO_PAD_DIGITAL || type > SIO_PAD_NEGCON)
+-        type = SIO_PAD_DIGITAL;
++    type = pad_type_for_slot(slot, type);
+     if (type == SIO_PAD_JOGCON)
+         pad_supports_config[slot] = 1;
+     pad_commit_type(slot, (uint8_t)type);
+@@ -1194,6 +1266,39 @@ void sio_get_pad_negcon(int slot, uint8_t out[3]) {
+     memcpy(out, pad_negcon_analog[slot], 3);
+ }
+ 
++static int16_t pad_mouse_accumulate(int16_t accum, int delta) {
++    int v = (int)accum + delta;
++    if (v > MOUSE_ACCUM_MAX) v = MOUSE_ACCUM_MAX;
++    if (v < MOUSE_ACCUM_MIN) v = MOUSE_ACCUM_MIN;
++    return (int16_t)v;
++}
++
++void sio_set_pad_mouse(int slot, int dx, int dy, uint16_t buttons) {
++    uint8_t held = 0;
++    if (slot < 0 || slot >= PSX_MAX_PLAYERS || pad_analog[slot] != SIO_PAD_MOUSE)
++        return;
++    /* Unpolled for a quarter second: the device forgets what it owed. */
++    const uint64_t now = psx_get_cycle_count();
++    if (now - pad_mouse_clear_ref[slot] >= MOUSE_CLEAR_CYCLES) {
++        pad_mouse_clear_ref[slot] = now;
++        pad_mouse_dx[slot] = 0;
++        pad_mouse_dy[slot] = 0;
++        pad_mouse_btn[slot] = 0;
++    }
++    if (!(buttons & SIO_MOUSE_BTN_RIGHT)) held |= 0x01;
++    if (!(buttons & SIO_MOUSE_BTN_LEFT))  held |= 0x02;
++    pad_mouse_dx[slot] = pad_mouse_accumulate(pad_mouse_dx[slot], dx);
++    pad_mouse_dy[slot] = pad_mouse_accumulate(pad_mouse_dy[slot], dy);
++    pad_mouse_btn[slot] |= held;
++    pad_mouse_held[slot] = held;
++}
++
++void sio_get_pad_mouse(int slot, int *dx, int *dy) {
++    const int ok = slot >= 0 && slot < PSX_MAX_PLAYERS;
++    if (dx) *dx = ok ? pad_mouse_dx[slot] : 0;
++    if (dy) *dy = ok ? pad_mouse_dy[slot] : 0;
++}
++
+ int sio_get_pad_mode_locked(int slot) {
+     return (slot >= 0 && slot < PSX_MAX_PLAYERS) ? analog_mode_locked[slot] : 0;
+ }
+@@ -1204,8 +1309,7 @@ int sio_get_pad_mode_locked(int slot) {
+ void sio_request_pad_type(int slot, int type) {
+     if (slot < 0 || slot >= PSX_MAX_PLAYERS) return;
+     if (sio_tap_force_digital(slot)) type = SIO_PAD_DIGITAL;
+-    if (type < SIO_PAD_DIGITAL || type > SIO_PAD_NEGCON)
+-        type = SIO_PAD_DIGITAL;
++    type = pad_type_for_slot(slot, type);
+     /* A JogCon is a config-capable controller even when its type is selected
+      * through this deferred per-frame path (debug injection / hot selection).
+      * Otherwise it reports ID 0xE3 to 0x42 but silently ignores R4's 0x43
+@@ -1427,6 +1531,25 @@ static void pad_process_byte(uint8_t tx_byte) {
+                 pad_response_idx = 0;
+                 pad_current_cmd = 0;
+             }
++        } else if (pad_analog[lp] == SIO_PAD_MOUSE) {
++            /* The mouse shifts out its ID low byte (0x12) with the command
++             * byte whatever the command is. Only 0x42 continues: 5Ah, the
++             * button halfword and the two motion bytes, ACKing all but the
++             * last. Anything else gets no ACK and ends the transaction
++             * (Mednafen mouse.cpp command_phase -1). It never enters config
++             * mode, so 0x43..0x4F take this same path. */
++            sio_rx_data = 0x12;
++            if (tx_byte == 0x42) {
++                pad_fill_mouse_poll(lp, pad_response);
++                pad_response_len = 6;
++                pad_state = PAD_SEND_RESPONSE;
++                sio_stat |= SIO_STAT_ACK;
++            } else {
++                pad_state = PAD_IDLE;
++                pad_response_len = 0;
++                pad_response_idx = 0;
++                pad_current_cmd = 0;
++            }
+         } else if (tx_byte == 0x42) {
+             /* Read poll. Analog (or in-config) uses the 8-byte format with the
+              * four stick axes; a plain digital pad uses the 4-byte format. */
+@@ -1635,6 +1758,7 @@ static void pad_process_byte(uint8_t tx_byte) {
+                 /* The six data bytes after 0x42's leading 0x00 occupy response
+                  * indexes 2..7. Route each through the map negotiated by 0x4D. */
+                 if (pad_current_cmd == 0x42 && pad_analog[rs] != SIO_PAD_NEGCON &&
++                    pad_analog[rs] != SIO_PAD_MOUSE &&
+                     pad_response_idx >= 2 && pad_response_idx < 8) {
+                     const unsigned map_index = (unsigned)pad_response_idx - 2u;
+                     const uint8_t motor = pad_rumble_map[rs][map_index];
+@@ -3043,6 +3167,24 @@ static int sio_snap_emit_pad_mode(PstW *w) {
+            pst_w_bytes(w, pad_analog_device, sizeof(pad_analog_device));
+ }
+ 
++/* PlayStation Mouse motion/buttons still owed to the guest and the clear
++ * timer reference; appended after the pad mode so older snapshots stay
++ * loadable (they restore a mouse that owes nothing). */
++static int sio_snap_emit_mouse(PstW *w) {
++    for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
++        if (!pst_w_i16(w, pad_mouse_dx[s]) || !pst_w_i16(w, pad_mouse_dy[s]) ||
++            !pst_w_u8(w, pad_mouse_btn[s]) || !pst_w_u8(w, pad_mouse_held[s]) ||
++            !pst_w_u64(w, pad_mouse_clear_ref[s]))
++            return 0;
++    }
++    return 1;
++}
++
++static void sio_mouse_legacy_defaults(void) {
++    for (int s = 0; s < PSX_MAX_PLAYERS; s++)
++        pad_mouse_clear(s);
++}
++
+ static void sio_pad_mode_legacy_defaults(void) {
+     for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
+         analog_mode_locked[s] = 0;
+@@ -3059,12 +3201,14 @@ static int sio_snap_emit_fsm(PstW *w) {
+ static int sio_snap_emit(PstW *w) {
+     return sio_snap_emit_regs(w) && sio_snap_emit_pads(w) &&
+            sio_snap_emit_mc(w) && sio_snap_emit_fsm(w) && sio_snap_emit_rumble(w) &&
+-           sio_snap_emit_jogcon(w) && sio_snap_emit_pad_mode(w);
++           sio_snap_emit_jogcon(w) && sio_snap_emit_pad_mode(w) &&
++           sio_snap_emit_mouse(w);
+ }
+ 
+ /* Cumulative section end offsets in the snapshot wire:
+  * out[0]=regs, out[1]=pads, out[2]=memcard, out[3]=fsm_pace (netplay),
+- * out[4]=full including fsm metadata, rumble, JogCon and pad-mode state. */
++ * out[4]=full including fsm metadata, rumble, JogCon, pad-mode and mouse
++ * state. */
+ void sio_snapshot_section_ends(uint32_t out[5]) {
+     PstW w;
+     pst_w_init(&w, NULL, 0);
+@@ -3080,6 +3224,7 @@ void sio_snapshot_section_ends(uint32_t out[5]) {
+     (void)sio_snap_emit_rumble(&w);
+     (void)sio_snap_emit_jogcon(&w);
+     (void)sio_snap_emit_pad_mode(&w);
++    (void)sio_snap_emit_mouse(&w);
+     out[4] = (uint32_t)w.written;
+ }
+ 
+@@ -3177,6 +3322,7 @@ static int sio_snap_parse(PstR *r) {
+             pad_rumble_map[s][1] = 0x01;
+         }
+         sio_pad_mode_legacy_defaults();
++        sio_mouse_legacy_defaults();
+         return 1;
+     }
+     if (!pst_r_bytes(r, pad_rumble_map, sizeof(pad_rumble_map)) ||
+@@ -3190,6 +3336,7 @@ static int sio_snap_parse(PstR *r) {
+         memset(pad_jogcon_motor_command, 0, sizeof(pad_jogcon_motor_command));
+         memset(pad_jogcon_motor_strength, 0, sizeof(pad_jogcon_motor_strength));
+         sio_pad_mode_legacy_defaults();
++        sio_mouse_legacy_defaults();
+         return 1;
+     }
+     if (!pst_r_bytes(r, pad_jogcon_last_steering,
+@@ -3200,6 +3347,7 @@ static int sio_snap_parse(PstR *r) {
+     /* Pre-pad-mode snapshots: unlocked, device inferred from the type. */
+     if (r->p == r->end) {
+         sio_pad_mode_legacy_defaults();
++        sio_mouse_legacy_defaults();
+         return 1;
+     }
+     if (!pst_r_bytes(r, analog_mode_locked, sizeof(analog_mode_locked)) ||
+@@ -3210,6 +3358,22 @@ static int sio_snap_parse(PstR *r) {
+         if (pad_analog_device[s] != SIO_PAD_JOGCON)
+             pad_analog_device[s] = SIO_PAD_DUALSHOCK;
+     }
++    /* Pre-mouse snapshots: no motion or clicks owed. */
++    if (r->p == r->end) {
++        sio_mouse_legacy_defaults();
++        return 1;
++    }
++    for (int s = 0; s < PSX_MAX_PLAYERS; s++) {
++        int16_t dx, dy;
++        if (!pst_r_i16(r, &dx) || !pst_r_i16(r, &dy) ||
++            !pst_r_u8(r, &pad_mouse_btn[s]) || !pst_r_u8(r, &pad_mouse_held[s]) ||
++            !pst_r_u64(r, &pad_mouse_clear_ref[s]))
++            return 0;
++        pad_mouse_dx[s] = pad_mouse_accumulate(0, dx);
++        pad_mouse_dy[s] = pad_mouse_accumulate(0, dy);
++        pad_mouse_btn[s] &= 0x03;
++        pad_mouse_held[s] &= 0x03;
++    }
+     if (r->p != r->end) return 0;
+     return 1;
+ }
+@@ -3240,11 +3404,15 @@ int sio_snapshot_validate(const uint8_t *p, uint32_t len) {
+                                   sizeof(pad_jogcon_motor_command));
+     const uint32_t mode_bytes = (uint32_t)(sizeof(analog_mode_locked) +
+                                 sizeof(pad_analog_device));
++    const uint32_t mouse_bytes = (uint32_t)(PSX_MAX_PLAYERS * (2 + 2 + 1 + 1 + 8));
+     return p && (len == current ||
+-                 (len < current && len + mode_bytes == current) ||
+-                 (len < current && len + mode_bytes + jogcon_bytes == current) ||
++                 (len < current && len + mouse_bytes == current) ||
++                 (len < current && len + mouse_bytes + mode_bytes == current) ||
++                 (len < current &&
++                  len + mouse_bytes + mode_bytes + jogcon_bytes == current) ||
+                  (len < current &&
+-                  len + mode_bytes + jogcon_bytes + rumble_bytes == current));
++                  len + mouse_bytes + mode_bytes + jogcon_bytes + rumble_bytes ==
++                      current));
+ }
+ 
+ int sio_snapshot_read(const uint8_t *p, uint32_t len) {
+diff --git a/runtime/tests/test_launcher_device_roundtrip.cpp b/runtime/tests/test_launcher_device_roundtrip.cpp
+index bf514858..1be6c9e5 100644
+--- a/runtime/tests/test_launcher_device_roundtrip.cpp
++++ b/runtime/tests/test_launcher_device_roundtrip.cpp
+@@ -23,5 +23,39 @@ int main() {
+     assert(launcher_device_from_source(
+         2, " 030000005e0400008e02000000000000 ") ==
+         "030000005e0400008e02000000000000");
++
++    // A PlayStation Mouse seat shows as Keyboard; keeping Keyboard keeps the
++    // mouse, None or a gamepad replace it.
++    using PSXRecompV4::launcher_device_is_ps_mouse;
++    assert(launcher_device_is_ps_mouse(" Mouse "));
++    assert(launcher_device_is_ps_mouse("ps_mouse"));
++    assert(launcher_device_is_ps_mouse("PlayStation_Mouse"));
++    assert(!launcher_device_is_ps_mouse("keyboard"));
++    assert(!launcher_device_is_ps_mouse("mousepad"));
++    assert(launcher_source_from_device("mouse") == 1);
++    assert(launcher_device_from_source(1, " mouse ") == "mouse");
++    assert(launcher_device_from_source(1, "keyboard") == "keyboard");
++    assert(launcher_device_from_source(0, "mouse") == "none");
++    assert(launcher_device_from_source(2, "mouse") == "gamepad");
++
++    // Player 1's "PlayStation Mouse" entry (supports_ps_mouse + a recomp-ui
++    // with RECOMP_LAUNCHER_HAS_MOUSE_SOURCE): seeded from the device, and the
++    // keyboard-family source written back from the player's choice.
++    using PSXRecompV4::launcher_keyboard_device;
++    using PSXRecompV4::launcher_mouse_enabled_from_device;
++    assert(launcher_mouse_enabled_from_device("mouse") == 1);
++    assert(launcher_mouse_enabled_from_device(" PlayStation_Mouse ") == 1);
++    assert(launcher_mouse_enabled_from_device("keyboard") == 0);
++    assert(launcher_mouse_enabled_from_device("gamepad") == 0);
++    assert(launcher_mouse_enabled_from_device("none") == 0);
++    assert(launcher_keyboard_device(true, 1, "keyboard") == "mouse");
++    assert(launcher_keyboard_device(true, 1, "none") == "mouse");
++    assert(launcher_keyboard_device(true, 0, "mouse") == "keyboard");
++    assert(launcher_keyboard_device(true, 0, "keyboard") == "keyboard");
++    // Without the entry (title without supports_ps_mouse, or an older
++    // recomp-ui) a settings.toml mouse seat survives the launcher.
++    assert(launcher_keyboard_device(false, 0, "mouse") == "mouse");
++    assert(launcher_keyboard_device(false, 1, "keyboard") == "keyboard");
++    assert(launcher_keyboard_device(false, 0, "none") == "keyboard");
+     return 0;
+ }
+diff --git a/runtime/tests/test_pad_external_input.c b/runtime/tests/test_pad_external_input.c
+index 03a3c813..9f3ba4b3 100644
+--- a/runtime/tests/test_pad_external_input.c
++++ b/runtime/tests/test_pad_external_input.c
+@@ -1,5 +1,6 @@
+ /* Resolution order of external offline input (physical -> source -> mouse). */
+ #include "pad_external_input.h"
++#include "sio.h"
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -271,6 +272,17 @@ int main(void) {
+         /* No device and no source: the transform is not consulted. */
+         reset(); T.have_device = 0; T.xf_ret = 1;
+         CHECK(pad_ext_resolve(&hx, 0, &o) == 0 && T.xf_calls == 0);
++
++        /* A PlayStation Mouse port: the transform never sees it and the
++         * right-stick mouse policy is reset, not folded into the motion. */
++        reset();
++        T.local.analog = SIO_PAD_MOUSE; T.local.buttons = 0xf7ff;
++        T.local.lx = 0xFB; T.local.ly = 0x09; T.local.rx = T.local.ry = 0x80;
++        T.xf_ret = 1; T.mouse_override = 1; T.mouse_rx = 1; T.mouse_ry = 2;
++        CHECK(pad_ext_resolve(&hx, 0, &o) == 1 && T.xf_calls == 0);
++        CHECK(o.analog == SIO_PAD_MOUSE && o.buttons == 0xf7ff &&
++              o.lx == 0xFB && o.ly == 0x09 && o.rx == 0x80 && o.ry == 0x80);
++        CHECK(T.mouse_folds == 0 && T.mouse_resets == 1);
+     }
+ 
+     /* Gating predicate: live only when every blocking condition is clear. */
+diff --git a/runtime/tests/test_ps_mouse_input.c b/runtime/tests/test_ps_mouse_input.c
+new file mode 100644
+index 00000000..45accae6
+--- /dev/null
++++ b/runtime/tests/test_ps_mouse_input.c
+@@ -0,0 +1,126 @@
++/* Host PlayStation Mouse accumulator (ps_mouse_input.c): per-frame latching
++ * of summed SDL motion with fractional carry, signed-byte clipping with the
++ * rest owed to later frames, the owed-motion bound, click latching between
++ * frames, idempotent reads and reset. */
++
++#include "ps_mouse_input.h"
++#include "sio.h"
++#include <stdio.h>
++
++static int failures;
++
++#define EXPECT(label, expected, actual) do {                                  \
++    long e_ = (long)(expected), a_ = (long)(actual);                          \
++    if (e_ != a_) {                                                           \
++        fprintf(stderr, "FAIL %s: expected=%ld actual=%ld\n", label, e_, a_); \
++        failures++;                                                           \
++    }                                                                         \
++} while (0)
++
++static PsMouseFrame latch(void) {
++    PsMouseFrame f;
++    ps_mouse_input_latch();
++    ps_mouse_input_frame(&f);
++    return f;
++}
++
++int main(void) {
++    PsMouseFrame f, g;
++
++    ps_mouse_input_reset();
++    f = latch();
++    EXPECT("neutral.dx", 0, f.dx);
++    EXPECT("neutral.dy", 0, f.dy);
++    EXPECT("neutral.buttons", 0xFFFF, f.buttons);
++
++    /* Several SDL events between two frames sum; the frame consumes them. */
++    ps_mouse_input_motion(3.0f, -2.0f);
++    ps_mouse_input_motion(4.0f, -1.0f);
++    f = latch();
++    EXPECT("sum.dx", 7, f.dx);
++    EXPECT("sum.dy", -3, f.dy);
++    ps_mouse_input_frame(&g);
++    EXPECT("read.idempotent", 7, g.dx);
++    f = latch();
++    EXPECT("consumed.dx", 0, f.dx);
++    EXPECT("consumed.dy", 0, f.dy);
++
++    /* Sub-unit motion (high-DPI / scaled SDL3 deltas) is carried, not lost. */
++    for (int i = 0; i < 4; i++) ps_mouse_input_motion(0.25f, -0.5f);
++    f = latch();
++    EXPECT("fraction.dx", 1, f.dx);
++    EXPECT("fraction.dy", -2, f.dy);
++    ps_mouse_input_motion(0.6f, 0.0f);
++    f = latch();
++    EXPECT("fraction.partial", 0, f.dx);
++    ps_mouse_input_motion(0.6f, 0.0f);
++    f = latch();
++    EXPECT("fraction.carried", 1, f.dx);
++    ps_mouse_input_reset();
++
++    /* A flick beyond a signed byte is spread over frames. */
++    ps_mouse_input_motion(300.0f, -300.0f);
++    f = latch();
++    EXPECT("large.1.dx", 127, f.dx);
++    EXPECT("large.1.dy", -128, f.dy);
++    f = latch();
++    EXPECT("large.2.dx", 127, f.dx);
++    EXPECT("large.2.dy", -128, f.dy);
++    f = latch();
++    EXPECT("large.3.dx", 46, f.dx);
++    EXPECT("large.3.dy", -44, f.dy);
++    f = latch();
++    EXPECT("large.4.dx", 0, f.dx);
++
++    /* Owed motion is bounded (a stall is not aim) and NaN is ignored. */
++    ps_mouse_input_motion(1.0e9f, 0.0f);
++    ps_mouse_input_motion(0.0f / 0.0f, 5.0f);
++    {
++        long total = 0;
++        int frames = 0;
++        do { f = latch(); total += f.dx; } while (f.dx && ++frames < 100);
++        EXPECT("bound.total", 30 * 128, total);
++    }
++    ps_mouse_input_reset();
++
++    /* Buttons: held is reported every frame, a click inside one frame once. */
++    ps_mouse_input_button(PS_MOUSE_LEFT, 1);
++    f = latch();
++    EXPECT("left.held", (uint16_t)~SIO_MOUSE_BTN_LEFT, f.buttons);
++    f = latch();
++    EXPECT("left.still", (uint16_t)~SIO_MOUSE_BTN_LEFT, f.buttons);
++    ps_mouse_input_button(PS_MOUSE_LEFT, 0);
++    f = latch();
++    EXPECT("left.released", 0xFFFF, f.buttons);
++    ps_mouse_input_button(PS_MOUSE_RIGHT, 1);
++    ps_mouse_input_button(PS_MOUSE_RIGHT, 0);
++    f = latch();
++    EXPECT("right.click", (uint16_t)~SIO_MOUSE_BTN_RIGHT, f.buttons);
++    f = latch();
++    EXPECT("right.click.once", 0xFFFF, f.buttons);
++    ps_mouse_input_button(PS_MOUSE_LEFT, 1);
++    ps_mouse_input_button(PS_MOUSE_RIGHT, 1);
++    f = latch();
++    EXPECT("both", (uint16_t)~(SIO_MOUSE_BTN_LEFT | SIO_MOUSE_BTN_RIGHT),
++           f.buttons);
++    ps_mouse_input_button(0x40, 1); /* other buttons are not mouse buttons */
++
++    /* Reset forgets held buttons, clicks and owed motion. */
++    ps_mouse_input_motion(50.0f, 50.0f);
++    ps_mouse_input_reset();
++    ps_mouse_input_frame(&f);
++    EXPECT("reset.frame", 0xFFFF, f.buttons);
++    f = latch();
++    EXPECT("reset.buttons", 0xFFFF, f.buttons);
++    EXPECT("reset.dx", 0, f.dx);
++
++    ps_mouse_input_neutral(&f);
++    EXPECT("neutral.fn", 0xFFFF, f.buttons);
++
++    if (failures) {
++        fprintf(stderr, "ps_mouse_input_test: %d failure(s)\n", failures);
++        return 1;
++    }
++    printf("ps_mouse_input_test: OK\n");
++    return 0;
++}
+diff --git a/runtime/tests/test_psx_pad_apply.c b/runtime/tests/test_psx_pad_apply.c
+index 4281ef13..32e5b80e 100644
+--- a/runtime/tests/test_psx_pad_apply.c
++++ b/runtime/tests/test_psx_pad_apply.c
+@@ -57,6 +57,7 @@ int memcard_write_sector(int card, int sector, const uint8_t *buf) {
+     (void)card; (void)sector; (void)buf; return -1;
+ }
+ void memcard_flush(int card) { (void)card; }
++int memcard_last_flush_result(int card) { (void)card; return -1; }
+ 
+ #define SIO_TX_DATA 0x1F801040u
+ #define SIO_RX_DATA 0x1F801040u
+@@ -144,6 +145,46 @@ int main(void) {
+         EXPECT("back.pressure.cleared", 0, p[0] | p[1] | p[2]);
+     }
+ 
++    /* PlayStation Mouse: lx/ly carry this frame's signed motion and the
++     * buttons word the active-low mouse bits. The type request lands at the
++     * first idle boundary; each apply adds its motion exactly once. */
++    {
++        PsxNetPad m = { 0xFFFFu, 0x00, 0x00, 0x80, 0x80, SIO_PAD_MOUSE, 1 };
++        fresh();
++        psx_pad_apply_to_sio(0, &m);
++        poll_bytes(b);
++        EXPECT("mouse.id", 0x12, b[1]);
++        EXPECT("mouse.status", 0x5A, b[2]);
++        EXPECT("mouse.idle.high", 0xFC, b[4]);
++        EXPECT("mouse.frame.end", 0xFF, b[7]);
++        m.lx = (uint8_t)(int8_t)-7;
++        m.ly = 12;
++        m.buttons = (uint16_t)~SIO_MOUSE_BTN_LEFT;
++        psx_pad_apply_to_sio(0, &m);
++        psx_pad_apply_to_sio(0, &m);
++        (void)xchg(0x01); (void)xchg(0x42);
++        for (int i = 2; i < 7; i++) b[i] = xchg(0x00);
++        EXPECT("mouse.left", 0xF4, b[4]);
++        EXPECT("mouse.x.twice", (uint8_t)-14, b[5]);
++        EXPECT("mouse.y.twice", 24, b[6]);
++        EXPECT("mouse.no.sticks", 0x80, (sio_get_pad_sticks(0, a), a[2]));
++        /* Leaving the mouse drops what it still owed. */
++        m.lx = 100;
++        psx_pad_apply_to_sio(0, &m);
++        psx_pad_apply_to_sio(0, &ds);
++        poll_bytes(b);
++        EXPECT("mouse.to.ds", 0x73, b[1]);
++        {
++            int dx = 1, dy = 1;
++            sio_get_pad_mouse(0, &dx, &dy);
++            EXPECT("mouse.to.ds.cleared", 0, dx | dy);
++        }
++        /* Local-only: netplay normalization never yields a mouse. */
++        PsxNetPad w = m;
++        psx_netplay_normalize_pad(&w);
++        EXPECT("mouse.not.on.wire", 0, w.analog);
++    }
++
+     /* An out-of-range type applies as digital. */
+     PsxNetPad bad = ds;
+     bad.analog = 9;
+diff --git a/runtime/tests/test_sio_digital_command.c b/runtime/tests/test_sio_digital_command.c
+index 0293b4e7..14aca519 100644
+--- a/runtime/tests/test_sio_digital_command.c
++++ b/runtime/tests/test_sio_digital_command.c
+@@ -56,6 +56,7 @@ int memcard_write_sector(int card, int sector, const uint8_t *buf) {
+     (void)card; (void)sector; (void)buf; return -1;
+ }
+ void memcard_flush(int card) { (void)card; }
++int memcard_last_flush_result(int card) { (void)card; return -1; }
+ 
+ 
+ #define DATA 0x1F801040u
+diff --git a/runtime/tests/test_sio_dualshock_rumble.c b/runtime/tests/test_sio_dualshock_rumble.c
+index 65cf5cf1..1127cd0c 100644
+--- a/runtime/tests/test_sio_dualshock_rumble.c
++++ b/runtime/tests/test_sio_dualshock_rumble.c
+@@ -57,6 +57,7 @@ int memcard_write_sector(int card, int sector, const uint8_t *buf) {
+     (void)card; (void)sector; (void)buf; return -1;
+ }
+ void memcard_flush(int card) { (void)card; }
++int memcard_last_flush_result(int card) { (void)card; return -1; }
+ 
+ #define SIO_TX_DATA 0x1F801040u
+ #define SIO_RX_DATA 0x1F801040u
+@@ -170,19 +171,22 @@ int main(void) {
+     EXPECT("snapshot.current.small", 0x01, small);
+     EXPECT("snapshot.current.large", 0x80, large);
+ 
+-    /* The pad-mode section (0x44 lock + device) and the JogCon rollback
+-     * fields each add four bytes for a two-seat build. Removing them restores
+-     * the preceding formats; removing all twenty-four trailing bytes models a
+-     * pre-rumble state. */
++    /* The trailing mouse section adds 28 bytes for a two-seat build; the
++     * pad-mode section (0x44 lock + device) and the JogCon rollback fields
++     * each add four more. Removing them restores the preceding formats;
++     * removing the twenty-four bytes before the mouse section as well models
++     * a pre-rumble state. */
++    EXPECT("snapshot.pre-mouse.read", 1,
++           sio_snapshot_read(snapshot, snapshot_len - 28));
+     EXPECT("snapshot.pre-pad-mode.read", 1,
+-           sio_snapshot_read(snapshot, snapshot_len - 4));
++           sio_snapshot_read(snapshot, snapshot_len - 28 - 4));
+     EXPECT("snapshot.pre-jogcon.read", 1,
+-           sio_snapshot_read(snapshot, snapshot_len - 8));
++           sio_snapshot_read(snapshot, snapshot_len - 28 - 8));
+     EXPECT("snapshot.pre-jogcon.small", 0x01,
+            (sio_get_pad_rumble(0, &small, &large), small));
+     EXPECT("snapshot.pre-jogcon.large", 0x80, large);
+     EXPECT("snapshot.legacy.read", 1,
+-           sio_snapshot_read(snapshot, snapshot_len - 24));
++           sio_snapshot_read(snapshot, snapshot_len - 28 - 24));
+     sio_get_pad_rumble(0, &small, &large);
+     EXPECT("snapshot.legacy.small", 0x00, small);
+     EXPECT("snapshot.legacy.large", 0x00, large);
+diff --git a/runtime/tests/test_sio_jogcon_protocol.c b/runtime/tests/test_sio_jogcon_protocol.c
+index e49a90f3..e9dc9100 100644
+--- a/runtime/tests/test_sio_jogcon_protocol.c
++++ b/runtime/tests/test_sio_jogcon_protocol.c
+@@ -57,6 +57,7 @@ int memcard_write_sector(int card, int sector, const uint8_t *buf) {
+     (void)card; (void)sector; (void)buf; return -1;
+ }
+ void memcard_flush(int card) { (void)card; }
++int memcard_last_flush_result(int card) { (void)card; return -1; }
+ 
+ #define SIO_TX_DATA 0x1F801040u
+ #define SIO_RX_DATA 0x1F801040u
+@@ -221,10 +222,11 @@ int main(void) {
+     (void)xchg(0, 0x00);
+ 
+     const uint32_t snapshot_len = sio_snapshot_bytes();
+-    /* JogCon steering[0] sits before steering[1..], the motor bytes and the
+-     * trailing pad-mode section (lock + device per pad). */
++    /* JogCon steering[0] sits before steering[1..], the motor bytes, the
++     * pad-mode section (lock + device per pad) and the trailing mouse section
++     * (14 bytes per pad). */
+     const uint32_t steering_at = snapshot_len - 2u * PSX_MAX_PLAYERS -
+-                                 2u * PSX_MAX_PLAYERS;
++                                 2u * PSX_MAX_PLAYERS - 14u * PSX_MAX_PLAYERS;
+     uint8_t *snapshot = (uint8_t *)malloc(snapshot_len);
+     if (!snapshot) return 1;
+     sio_snapshot_write(snapshot);
+diff --git a/runtime/tests/test_sio_mouse_protocol.c b/runtime/tests/test_sio_mouse_protocol.c
+new file mode 100644
+index 00000000..89097e4b
+--- /dev/null
++++ b/runtime/tests/test_sio_mouse_protocol.c
+@@ -0,0 +1,519 @@
++/* PlayStation Mouse (SCPH-1030) wire protocol regression: ID 5A12h, the
++ * six-byte 0x42 poll with ACK on every byte but the last, active-low button
++ * bits 10 (right) and 11 (left), signed relative motion that accumulates
++ * between polls and is consumed exactly once, large motion spread over
++ * several polls, click latching, the quarter-second stale clear, unsupported
++ * commands, device swaps with the DualShock family and NeGcon, snapshot and
++ * multitap seats (built a second time with PSX_MAX_PLAYERS=5).
++ *
++ * Reference: PSX-SPX controllersandmemorycards "Mouse" and Mednafen
++ * psx/input/mouse.cpp (also the libretro Beetle PSX core). */
++
++#include "sio.h"
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++uint32_t sio_snapshot_bytes(void);
++void sio_snapshot_write(uint8_t *p);
++int sio_snapshot_read(const uint8_t *p, uint32_t len);
++
++uint32_t i_stat = 0;
++uint32_t i_mask = 0;
++uint32_t g_debug_current_func_addr = 0;
++uint32_t g_debug_last_store_pc = 0;
++int psx_get_in_exception(void) { return 0; }
++uint8_t psx_read_byte(uint32_t addr) { (void)addr; return 0; }
++uint32_t psx_read_word(uint32_t addr) { (void)addr; return 0; }
++
++/* sio.c gates card-transfer deferral on `psx_get_cycle_count() < deadline`, so
++ * a constant clock would defer forever. Advance monotonically; tests jump it
++ * forward to cross the mouse's stale-motion window. */
++static uint64_t s_clock;
++uint64_t psx_get_cycle_count(void) { return s_clock += 64; }
++static void clock_skip(uint64_t cycles) { s_clock += cycles; }
++uint32_t memory_get_sr(void) { return 0; }
++void debug_server_poll(void) {}
++void debug_server_log_sio_write(uint32_t a, uint32_t v, uint8_t w) {
++    (void)a; (void)v; (void)w;
++}
++void starvation_ring_record(uint8_t k, uint8_t tx, uint8_t rx, uint16_t c,
++                            uint16_t st, uint8_t d, uint8_t ss, uint16_t ms,
++                            uint8_t mc, uint16_t sec, uint8_t di, uint32_t f) {
++    (void)k; (void)tx; (void)rx; (void)c; (void)st; (void)d; (void)ss;
++    (void)ms; (void)mc; (void)sec; (void)di; (void)f;
++}
++void card_read_summary_record(uint8_t s, uint8_t c, uint16_t sec, uint8_t e,
++                              uint8_t chk, uint8_t d0, uint8_t d1, uint32_t f) {
++    (void)s; (void)c; (void)sec; (void)e; (void)chk; (void)d0; (void)d1; (void)f;
++}
++void card_data_writes_arm(uint8_t v, uint16_t s, uint8_t i, uint8_t sl) {
++    (void)v; (void)s; (void)i; (void)sl;
++}
++void event_ring_record_aux(uint16_t k, uint8_t d, uint32_t a) {
++    (void)k; (void)d; (void)a;
++}
++void psx_irq_raise(uint32_t bit, uint32_t detail) {
++    (void)detail; i_stat |= 1u << bit;
++}
++int memcard_is_present(int card) { (void)card; return 0; }
++int memcard_read_sector(int card, int sector, uint8_t *buf) {
++    (void)card; (void)sector; memset(buf, 0, 128); return -1;
++}
++int memcard_write_sector(int card, int sector, const uint8_t *buf) {
++    (void)card; (void)sector; (void)buf; return -1;
++}
++void memcard_flush(int card) { (void)card; }
++int memcard_last_flush_result(int card) { (void)card; return -1; }
++
++#define SIO_TX_DATA 0x1F801040u
++#define SIO_RX_DATA 0x1F801040u
++#define SIO_CTRL    0x1F80104Au
++#define CTRL_TX_EN      (1u << 0)
++#define CTRL_SELECT     (1u << 1)
++#define CTRL_ACK        (1u << 4)
++#define CTRL_ACK_IRQ_EN (1u << 12)
++#define CTRL_SLOT       (1u << 13)
++
++#define NONE  0xFFFFu
++#define LEFT  ((uint16_t)~SIO_MOUSE_BTN_LEFT)
++#define RIGHT ((uint16_t)~SIO_MOUSE_BTN_RIGHT)
++#define BOTH  ((uint16_t)~(SIO_MOUSE_BTN_LEFT | SIO_MOUSE_BTN_RIGHT))
++
++static int failures;
++
++#define EXPECT(label, expected, actual) do {                                  \
++    unsigned e_ = (unsigned)(expected), a_ = (unsigned)(actual);              \
++    if (e_ != a_) {                                                           \
++        fprintf(stderr, "FAIL %s: expected=0x%X actual=0x%X\n",             \
++                label, e_, a_);                                               \
++        failures++;                                                           \
++    }                                                                         \
++} while (0)
++
++static int last_ack;
++
++/* One byte on the pad bus; last_ack reports whether the device pulsed ACK
++ * (IRQ7) after it, i.e. whether it wants another byte. */
++static uint8_t xchg(int slot, uint8_t tx) {
++    const uint16_t ctrl = (uint16_t)(CTRL_TX_EN | CTRL_SELECT |
++        CTRL_ACK_IRQ_EN | (slot ? CTRL_SLOT : 0));
++    i_stat = 0;
++    sio_write(SIO_CTRL, ctrl);
++    sio_write(SIO_TX_DATA, tx);
++    sio_tick(2000);
++    const uint8_t rx = (uint8_t)sio_read(SIO_RX_DATA);
++    last_ack = (i_stat & (1u << 7)) ? 1 : 0;
++    sio_write(SIO_CTRL, ctrl | CTRL_ACK);
++    return rx;
++}
++
++/* Full mouse 0x42 poll; returns the ID and fills the four bytes after 0x5A
++ * (buttons low, buttons high, X, Y). */
++/* Deassert /SEL between transactions, as a pad driver does; the port bit is
++ * latched when the next transaction opens. */
++static void deselect(void) { sio_write(SIO_CTRL, 0); }
++
++static uint8_t mouse_poll(int slot, uint8_t out[4]) {
++    uint8_t id;
++    deselect();
++    (void)xchg(slot, 0x01);
++    id = xchg(slot, 0x42);
++    EXPECT("poll.status", 0x5A, xchg(slot, 0x00));
++    for (int i = 0; i < 4; i++) out[i] = xchg(slot, 0x00);
++    EXPECT("poll.end.noack", 0, last_ack);
++    return id;
++}
++
++/* ID of the next 0x42 for any pad type, draining the rest of its frame. */
++static uint8_t poll_id(int slot) {
++    uint8_t id;
++    deselect();
++    (void)xchg(slot, 0x01);
++    id = xchg(slot, 0x42);
++    while (last_ack) (void)xchg(slot, 0x00);
++    return id;
++}
++
++static void mouse_on(int slot) {
++    sio_init();
++    sio_connect_pad(slot);
++    sio_set_pad_type(slot, SIO_PAD_MOUSE, 0x80, 0x80, 0x80, 0x80);
++    sio_set_pad_config_capable(slot, 0);
++}
++
++/* Cases 1-4: ID 0x12, status 0x5A, six-byte frame with the ACK pattern, and
++ * the neutral frame. */
++static void wire(void) {
++    mouse_on(0);
++    EXPECT("wire.type", SIO_PAD_MOUSE, sio_get_pad_analog(0));
++    EXPECT("wire.prefix", 0xFF, xchg(0, 0x01));
++    EXPECT("wire.prefix.ack", 1, last_ack);
++    EXPECT("wire.id", 0x12, xchg(0, 0x42));
++    EXPECT("wire.id.ack", 1, last_ack);
++    EXPECT("wire.status", 0x5A, xchg(0, 0x00));
++    EXPECT("wire.status.ack", 1, last_ack);
++    EXPECT("wire.buttons.low", 0xFF, xchg(0, 0x00));
++    EXPECT("wire.buttons.low.ack", 1, last_ack);
++    EXPECT("wire.buttons.high", 0xFC, xchg(0, 0x00));
++    EXPECT("wire.buttons.high.ack", 1, last_ack);
++    EXPECT("wire.x", 0x00, xchg(0, 0x00));
++    EXPECT("wire.x.ack", 1, last_ack);
++    EXPECT("wire.y", 0x00, xchg(0, 0x00));
++    EXPECT("wire.y.noack", 0, last_ack);
++    /* Frame over: the next byte is hi-z and the bus is idle again. */
++    EXPECT("wire.after.hiz", 0xFF, xchg(0, 0x00));
++    EXPECT("wire.after.noack", 0, last_ack);
++
++    /* The second port answers on its own, the first stays a mouse. */
++    sio_connect_pad(1);
++    sio_set_pad_type(1, SIO_PAD_DIGITAL, 0x80, 0x80, 0x80, 0x80);
++    EXPECT("wire.port2.digital", 0x41, poll_id(1));
++    EXPECT("wire.port1.still.mouse", 0x12, poll_id(0));
++}
++
++/* Cases 5-6: left and right buttons, pressed and released, active low. */
++static void buttons(void) {
++    uint8_t d[4];
++    mouse_on(0);
++    sio_set_pad_mouse(0, 0, 0, LEFT);
++    EXPECT("left.id", 0x12, mouse_poll(0, d));
++    EXPECT("left.low", 0xFF, d[0]);
++    EXPECT("left.high", 0xF4, d[1]);
++    sio_set_pad_mouse(0, 0, 0, NONE);
++    mouse_poll(0, d);
++    EXPECT("left.released", 0xFC, d[1]);
++
++    sio_set_pad_mouse(0, 0, 0, RIGHT);
++    mouse_poll(0, d);
++    EXPECT("right.high", 0xF8, d[1]);
++    sio_set_pad_mouse(0, 0, 0, NONE);
++    mouse_poll(0, d);
++    EXPECT("right.released", 0xFC, d[1]);
++
++    sio_set_pad_mouse(0, 0, 0, BOTH);
++    mouse_poll(0, d);
++    EXPECT("both.high", 0xF0, d[1]);
++    /* Held across polls: reported every poll until released. */
++    mouse_poll(0, d);
++    EXPECT("both.held", 0xF0, d[1]);
++    sio_set_pad_mouse(0, 0, 0, NONE);
++    mouse_poll(0, d);
++    EXPECT("both.released", 0xFC, d[1]);
++
++    /* Pad buttons outside bits 10/11 never reach the mouse frame. */
++    sio_set_pad_mouse(0, 0, 0, 0x0000u);
++    mouse_poll(0, d);
++    EXPECT("other.bits.low", 0xFF, d[0]);
++    EXPECT("other.bits.high", 0xF0, d[1]);
++    sio_set_pad_mouse(0, 0, 0, NONE);
++    mouse_poll(0, d);
++
++    /* A click between two polls is reported once, then released. */
++    sio_set_pad_mouse(0, 0, 0, LEFT);
++    sio_set_pad_mouse(0, 0, 0, NONE);
++    mouse_poll(0, d);
++    EXPECT("click.latched", 0xF4, d[1]);
++    mouse_poll(0, d);
++    EXPECT("click.once", 0xFC, d[1]);
++}
++
++/* Cases 7-10: signed X/Y, summing between polls, no double reporting. */
++static void motion(void) {
++    uint8_t d[4];
++    int dx = 0, dy = 0;
++    mouse_on(0);
++    sio_set_pad_mouse(0, 5, 0, NONE);
++    mouse_poll(0, d);
++    EXPECT("x.pos", 0x05, d[2]);
++    EXPECT("x.pos.y", 0x00, d[3]);
++    sio_set_pad_mouse(0, -5, 0, NONE);
++    mouse_poll(0, d);
++    EXPECT("x.neg", 0xFB, d[2]);
++    sio_set_pad_mouse(0, 0, 9, NONE);
++    mouse_poll(0, d);
++    EXPECT("y.pos.x", 0x00, d[2]);
++    EXPECT("y.pos", 0x09, d[3]);
++    sio_set_pad_mouse(0, 0, -9, NONE);
++    mouse_poll(0, d);
++    EXPECT("y.neg", 0xF7, d[3]);
++
++    sio_set_pad_mouse(0, 3, -2, NONE);
++    sio_set_pad_mouse(0, 4, -6, NONE);
++    sio_set_pad_mouse(0, -1, 1, NONE);
++    sio_get_pad_mouse(0, &dx, &dy);
++    EXPECT("sum.owed.x", 6, dx);
++    EXPECT("sum.owed.y", (unsigned)-7, dy);
++    mouse_poll(0, d);
++    EXPECT("sum.x", 0x06, d[2]);
++    EXPECT("sum.y", 0xF9, d[3]);
++    sio_get_pad_mouse(0, &dx, &dy);
++    EXPECT("sum.consumed.x", 0, dx);
++    EXPECT("sum.consumed.y", 0, dy);
++    mouse_poll(0, d);
++    EXPECT("once.x", 0x00, d[2]);
++    EXPECT("once.y", 0x00, d[3]);
++
++    /* Opposite motion between polls cancels out. */
++    sio_set_pad_mouse(0, 40, 0, NONE);
++    sio_set_pad_mouse(0, -40, 0, NONE);
++    mouse_poll(0, d);
++    EXPECT("cancel.x", 0x00, d[2]);
++}
++
++/* Case 11: motion beyond a signed byte is clipped per poll and the rest is
++ * delivered by later polls; the device accumulator saturates at 30 polls'
++ * worth like Mednafen's. */
++static void large_motion(void) {
++    uint8_t d[4];
++    int dx = 0, dy = 0, sum_x = 0, sum_y = 0, polls = 0;
++    mouse_on(0);
++    sio_set_pad_mouse(0, 300, -300, NONE);
++    mouse_poll(0, d);
++    EXPECT("large.1.x", 0x7F, d[2]);
++    EXPECT("large.1.y", 0x80, d[3]);
++    mouse_poll(0, d);
++    EXPECT("large.2.x", 0x7F, d[2]);
++    EXPECT("large.2.y", 0x80, d[3]);
++    mouse_poll(0, d);
++    EXPECT("large.3.x", 46, d[2]);
++    EXPECT("large.3.y", (uint8_t)-44, d[3]);
++    mouse_poll(0, d);
++    EXPECT("large.4.x", 0, d[2]);
++    EXPECT("large.4.y", 0, d[3]);
++
++    sio_set_pad_mouse(0, 100000, -100000, NONE);
++    sio_get_pad_mouse(0, &dx, &dy);
++    EXPECT("clamp.x", 30 * 127, dx);
++    EXPECT("clamp.y", (unsigned)(30 * -128), dy);
++    do {
++        mouse_poll(0, d);
++        sum_x += (int8_t)d[2];
++        sum_y += (int8_t)d[3];
++    } while ((d[2] || d[3]) && ++polls < 64);
++    EXPECT("clamp.delivered.x", 30 * 127, sum_x);
++    EXPECT("clamp.delivered.y", (unsigned)(30 * -128), sum_y);
++    EXPECT("clamp.polls", 30, polls);
++}
++
++/* Case 12: commands other than 0x42 (config, rumble, garbage) get the ID with
++ * no ACK and end the transaction; they neither enter config mode nor eat the
++ * owed motion. A digital-pad style address other than 0x01 is hi-z. */
++static void unsupported(void) {
++    static const uint8_t cmds[] = { 0x43, 0x44, 0x45, 0x46, 0x47, 0x4C, 0x4D,
++                                    0x4F, 0x40, 0x00, 0xFF };
++    uint8_t d[4];
++    mouse_on(0);
++    sio_set_pad_mouse(0, 12, -3, LEFT);
++    for (unsigned i = 0; i < sizeof cmds; i++) {
++        EXPECT("cmd.prefix", 0xFF, xchg(0, 0x01));
++        EXPECT("cmd.prefix.ack", 1, last_ack);
++        EXPECT("cmd.id", 0x12, xchg(0, cmds[i]));
++        EXPECT("cmd.noack", 0, last_ack);
++        EXPECT("cmd.hiz", 0xFF, xchg(0, 0x00));
++        EXPECT("cmd.hiz.noack", 0, last_ack);
++    }
++    EXPECT("cmd.no.config", SIO_PAD_MOUSE, sio_get_pad_analog(0));
++    EXPECT("cmd.addr.hiz", 0xFF, xchg(0, 0x02));
++    EXPECT("cmd.addr.noack", 0, last_ack);
++    EXPECT("cmd.after.id", 0x12, mouse_poll(0, d));
++    EXPECT("cmd.after.left", 0xF4, d[1]);
++    EXPECT("cmd.after.x", 12, d[2]);
++    EXPECT("cmd.after.y", (uint8_t)-3, d[3]);
++
++    /* Bytes the game sends during a poll drive no motors. */
++    {
++        uint8_t small = 1, large = 1;
++        (void)xchg(0, 0x01); (void)xchg(0, 0x42); (void)xchg(0, 0x00);
++        for (int i = 0; i < 4; i++) (void)xchg(0, 0xFF);
++        sio_get_pad_rumble(0, &small, &large);
++        EXPECT("rumble.small", 0, small);
++        EXPECT("rumble.large", 0, large);
++    }
++}
++
++static const uint8_t k_enter[6] = { 0x01, 0, 0, 0, 0, 0 };
++static const uint8_t k_exit[6]  = { 0x00, 0, 0, 0, 0, 0 };
++static const uint8_t k_lock_analog[6] = { 0x01, 0x03, 0, 0, 0, 0 };
++
++static uint8_t config_cmd(int slot, uint8_t cmd, const uint8_t data[6]) {
++    uint8_t id;
++    (void)xchg(slot, 0x01);
++    id = xchg(slot, cmd);
++    (void)xchg(slot, 0x00);
++    for (int i = 0; i < 6; i++) (void)xchg(slot, data[i]);
++    return id;
++}
++
++/* Case 13: switching between the mouse and the other controllers. A swap is a
++ * different device in the port: it applies at the next idle bus boundary even
++ * over a game's 0x44 lock, waits out a config handshake, and leaves no motion
++ * or clicks owed by the mouse that left. */
++static void switching(void) {
++    uint8_t d[4];
++    int dx = 0, dy = 0;
++    mouse_on(0);
++    sio_set_pad_mouse(0, 50, 50, LEFT);
++
++    sio_set_pad_config_capable(0, 1);
++    sio_request_pad_type(0, SIO_PAD_DUALSHOCK);
++    EXPECT("swap.mouse.until.idle", SIO_PAD_MOUSE, sio_get_pad_analog(0));
++    EXPECT("swap.to.ds", 0x73, poll_id(0));
++    sio_get_pad_mouse(0, &dx, &dy);
++    EXPECT("swap.to.ds.cleared", 0, dx);
++    /* Mouse input is ignored while another device is in the port. */
++    sio_set_pad_mouse(0, 20, 20, LEFT);
++    sio_get_pad_mouse(0, &dx, &dy);
++    EXPECT("swap.ds.ignores.mouse", 0, dx);
++
++    /* A locked DualShock gives way to the mouse, and the lock goes with it. */
++    EXPECT("swap.enter", 0x73, config_cmd(0, 0x43, k_enter));
++    EXPECT("swap.lock", 0xF3, config_cmd(0, 0x44, k_lock_analog));
++    sio_request_pad_type(0, SIO_PAD_MOUSE);
++    EXPECT("swap.held.in.config", 0xF3, config_cmd(0, 0x43, k_exit));
++    EXPECT("swap.locked", 1, sio_get_pad_mode_locked(0));
++    EXPECT("swap.to.mouse", 0x12, mouse_poll(0, d));
++    EXPECT("swap.to.mouse.unlocked", 0, sio_get_pad_mode_locked(0));
++    EXPECT("swap.to.mouse.neutral.btn", 0xFC, d[1]);
++    EXPECT("swap.to.mouse.neutral.x", 0x00, d[2]);
++
++    sio_request_pad_type(0, SIO_PAD_DIGITAL);
++    EXPECT("swap.to.digital", 0x41, poll_id(0));
++    sio_request_pad_type(0, SIO_PAD_NEGCON);
++    EXPECT("swap.to.negcon", 0x23, poll_id(0));
++    sio_request_pad_type(0, SIO_PAD_MOUSE);
++    EXPECT("swap.negcon.to.mouse", 0x12, poll_id(0));
++    sio_request_pad_type(0, SIO_PAD_JOGCON);
++    EXPECT("swap.to.jogcon", 0xE3, poll_id(0));
++
++    /* Out-of-range types stay rejected. */
++    sio_set_pad_type(0, SIO_PAD_MOUSE + 1, 0x80, 0x80, 0x80, 0x80);
++    EXPECT("swap.bad.type", SIO_PAD_DIGITAL, sio_get_pad_analog(0));
++
++    /* Unplugging drops owed motion; an empty port is hi-z with no ACK. */
++    sio_set_pad_type(0, SIO_PAD_MOUSE, 0x80, 0x80, 0x80, 0x80);
++    sio_set_pad_mouse(0, 7, 7, NONE);
++    sio_set_pad_connected(0, 0);
++    EXPECT("unplug.hiz", 0xFF, xchg(0, 0x01));
++    EXPECT("unplug.noack", 0, last_ack);
++    sio_set_pad_connected(0, 1);
++    sio_set_pad_type(0, SIO_PAD_MOUSE, 0x80, 0x80, 0x80, 0x80);
++    mouse_poll(0, d);
++    EXPECT("replug.x", 0x00, d[2]);
++}
++
++/* A mouse that is not polled for a quarter second forgets owed motion and
++ * clicks (Mednafen clear_timeout); one that is polled keeps accumulating. */
++static void stale_clear(void) {
++    uint8_t d[4];
++    int dx = 0, dy = 0;
++    mouse_on(0);
++    sio_set_pad_mouse(0, 30, 0, NONE);
++    mouse_poll(0, d);
++    sio_set_pad_mouse(0, 10, 0, LEFT);
++    sio_set_pad_mouse(0, 0, 0, NONE);
++    clock_skip(33868800u / 4u);
++    sio_set_pad_mouse(0, 2, 0, NONE);
++    sio_get_pad_mouse(0, &dx, &dy);
++    EXPECT("stale.dropped", 2, dx);
++    mouse_poll(0, d);
++    EXPECT("stale.x", 2, d[2]);
++    EXPECT("stale.click.dropped", 0xFC, d[1]);
++
++    clock_skip(33868800u / 8u);
++    sio_set_pad_mouse(0, 4, 0, NONE);
++    sio_get_pad_mouse(0, &dx, &dy);
++    EXPECT("fresh.kept", 4, dx);
++}
++
++/* Owed motion and latched clicks survive rollback; a snapshot from before
++ * the mouse section still loads and owes nothing. */
++static void snapshot(void) {
++    uint8_t d[4];
++    const uint32_t mouse_bytes = 14u * PSX_MAX_PLAYERS;
++    mouse_on(0);
++    sio_set_pad_mouse(0, 200, -5, LEFT);
++    sio_set_pad_mouse(0, 0, 0, NONE);
++
++    const uint32_t len = sio_snapshot_bytes();
++    uint8_t *snap = (uint8_t *)malloc(len);
++    if (!snap) { failures++; return; }
++    sio_snapshot_write(snap);
++
++    mouse_poll(0, d);
++    mouse_poll(0, d);
++    EXPECT("snap.restore", 1, sio_snapshot_read(snap, len));
++    EXPECT("snap.restore.type", SIO_PAD_MOUSE, sio_get_pad_analog(0));
++    mouse_poll(0, d);
++    EXPECT("snap.restore.click", 0xF4, d[1]);
++    EXPECT("snap.restore.x", 0x7F, d[2]);
++    EXPECT("snap.restore.y", (uint8_t)-5, d[3]);
++    mouse_poll(0, d);
++    EXPECT("snap.restore.rest", 200 - 127, d[2]);
++
++    EXPECT("snap.legacy.restore", 1, sio_snapshot_read(snap, len - mouse_bytes));
++    EXPECT("snap.legacy.type", SIO_PAD_MOUSE, sio_get_pad_analog(0));
++    mouse_poll(0, d);
++    EXPECT("snap.legacy.x", 0, d[2]);
++    EXPECT("snap.legacy.btn", 0xFC, d[1]);
++    EXPECT("snap.bad.len", 0, sio_snapshot_read(snap, len - 1));
++    free(snap);
++}
++
++#if PSX_MAX_PLAYERS >= 5
++/* Tap seats never present a mouse, with or without the DualShock-on-tap
++ * hack; the lone pad on the opposite console port still can. */
++static void multitap(void) {
++    sio_init();
++    sio_set_multitap(1);
++    sio_set_multitap_port(0);
++    sio_set_multitap_analog(1);
++    sio_connect_pad(0);
++    sio_connect_pad(4);
++    sio_set_pad_type(0, SIO_PAD_MOUSE, 0x80, 0x80, 0x80, 0x80);
++    EXPECT("tap.seat.digital", SIO_PAD_DIGITAL, sio_get_pad_analog(0));
++    sio_request_pad_type(0, SIO_PAD_MOUSE);
++    EXPECT("tap.seat.request", 0x41, poll_id(0));
++
++    sio_set_pad_type(4, SIO_PAD_MOUSE, 0x80, 0x80, 0x80, 0x80);
++    EXPECT("tap.lone.mouse", SIO_PAD_MOUSE, sio_get_pad_analog(4));
++    sio_set_pad_mouse(4, -3, 3, RIGHT);
++    {
++        uint8_t d[4];
++        EXPECT("tap.lone.id", 0x12, mouse_poll(1, d));
++        EXPECT("tap.lone.btn", 0xF8, d[1]);
++        EXPECT("tap.lone.x", (uint8_t)-3, d[2]);
++    }
++    sio_set_multitap(0);
++
++    /* Arming the tap under a mouse already on a seat demotes it. */
++    sio_init();
++    sio_connect_pad(0);
++    sio_set_pad_type(0, SIO_PAD_MOUSE, 0x80, 0x80, 0x80, 0x80);
++    sio_set_multitap_port(0);
++    sio_set_multitap(1);
++    EXPECT("tap.armed.demotes", 0x41, poll_id(0));
++    sio_set_multitap(0);
++}
++#endif
++
++int main(void) {
++    wire();
++    buttons();
++    motion();
++    large_motion();
++    unsupported();
++    switching();
++    stale_clear();
++    snapshot();
++#if PSX_MAX_PLAYERS >= 5
++    multitap();
++#endif
++    if (failures) {
++        fprintf(stderr, "sio_mouse_protocol_test: %d failure(s)\n", failures);
++        return 1;
++    }
++    printf("sio_mouse_protocol_test: OK\n");
++    return 0;
++}
+diff --git a/runtime/tests/test_sio_negcon_protocol.c b/runtime/tests/test_sio_negcon_protocol.c
+index 94d5304e..a7a4630e 100644
+--- a/runtime/tests/test_sio_negcon_protocol.c
++++ b/runtime/tests/test_sio_negcon_protocol.c
+@@ -59,6 +59,7 @@ int memcard_write_sector(int card, int sector, const uint8_t *buf) {
+     (void)card; (void)sector; (void)buf; return -1;
+ }
+ void memcard_flush(int card) { (void)card; }
++int memcard_last_flush_result(int card) { (void)card; return -1; }
+ 
+ #define SIO_TX_DATA 0x1F801040u
+ #define SIO_RX_DATA 0x1F801040u
+@@ -276,7 +277,8 @@ static void set_mode_keeps_device(void) {
+  * section still loads, unlocked. */
+ static void snapshot_pad_mode(void) {
+     uint8_t d[6];
+-    const uint32_t mode_bytes = 2u * PSX_MAX_PLAYERS;
++    /* The pad-mode section precedes the trailing mouse section. */
++    const uint32_t mode_bytes = 2u * PSX_MAX_PLAYERS + 14u * PSX_MAX_PLAYERS;
+     sio_init();
+     sio_connect_pad(0);
+     sio_set_pad_type(0, SIO_PAD_JOGCON, 0x80, 0x80, 0x80, 0x80);

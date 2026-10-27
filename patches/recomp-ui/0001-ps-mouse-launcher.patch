@@ -1,0 +1,328 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index de6ff6f..bf83219 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -482,6 +482,23 @@ if(BUILD_TESTING)
+         NAME recomp-ui-launcher-pad-mode
+         COMMAND $<TARGET_FILE:recomp-ui-launcher-pad-mode-test>)
+ 
++    # Player 1's mouse source entry: Snap's "Keyboard + Mouse" unchanged, a
++    # host-emulated mouse device (mouse_source_label / mouse_source_only).
++    add_executable(recomp-ui-launcher-mouse-source-test
++        tests/launcher_mouse_source_test.c
++        src/common/crc32.c
++        src/common/sha1.c
++        src/common/sha256.c
++        src/common/ips_patch.c
++        src/consoles/psx/memcard_format.c)
++    target_include_directories(recomp-ui-launcher-mouse-source-test PRIVATE
++        src src/common src/consoles/psx)
++    target_link_libraries(recomp-ui-launcher-mouse-source-test PRIVATE
++        ${RUI_SDL_TARGET})
++    add_test(
++        NAME recomp-ui-launcher-mouse-source
++        COMMAND $<TARGET_FILE:recomp-ui-launcher-mouse-source-test>)
++
+     # Genesis seat ceiling: four logical players for a four-player title,
+     # two for every two-port title, never more than the bind store routes.
+     add_executable(recomp-ui-genesis-seats-test
+diff --git a/src/common/backends/imgui/launcher_imgui.cpp b/src/common/backends/imgui/launcher_imgui.cpp
+index 5143884..21c7011 100644
+--- a/src/common/backends/imgui/launcher_imgui.cpp
++++ b/src/common/backends/imgui/launcher_imgui.cpp
+@@ -3365,8 +3365,8 @@ void pad_mode_selector(LauncherModel* m, const LauncherTheme& th, int p, float w
+ // by side. Same module, composed per the game's declared player count.
+ // Input-source Selectables shared by the player card (##src) and the Controller
+ // config (##csrc) combos. When the game sets has_mouse_controls, player 0's
+-// keyboard entry splits into "Keyboard + Mouse" (mouse-aim on) and "Keyboard"
+-// (off); otherwise it is the single legacy "Keyboard" entry, byte-for-byte
++// keyboard entry splits into "Keyboard + Mouse" (mouse-aim on; or the host's
++// mouse_source_label, e.g. "PlayStation Mouse") and "Keyboard" (off); otherwise it is the single legacy "Keyboard" entry, byte-for-byte
+ // identical to before for every non-mouse game.
+ void draw_source_selectables(LauncherModel* m, int p) {
+     const SystemProfile* src_prof = (const SystemProfile*)m->profile;
+@@ -3382,7 +3382,7 @@ void draw_source_selectables(LauncherModel* m, int p) {
+     if (m->has_mouse_controls && p == 0) {
+         const bool kbm = m->s.player_src[p] == 1 && m->s.mouse_enabled;
+         const bool kb  = m->s.player_src[p] == 1 && !m->s.mouse_enabled;
+-        if (ImGui::Selectable(ui_text("Keyboard + Mouse"), kbm))
++        if (ImGui::Selectable(ui_text(launcher_model_mouse_source_label(m)), kbm))
+             launcher_model_set_mouse_source(m, 1);
+         if (ImGui::Selectable(ui_text("Keyboard"), kb))
+             launcher_model_set_mouse_source(m, 0);
+@@ -5958,7 +5958,7 @@ void draw_controller_config_view(LauncherModel* m, const LauncherTheme& th) {
+     // three rebindable mouse buttons, each mapping to an N64 action. Placed
+     // after the source/deadzone card and before the bindings card. Entirely
+     // absent for every non-mouse game (has_mouse_controls == 0).
+-    if (m->has_mouse_controls && m->s.player_src[p] == 1) {
++    if (m->has_mouse_controls && !m->mouse_source_only && m->s.player_src[p] == 1) {
+         if (begin_panel("cfg_mouse", 0)) {
+             eyebrow("MOUSE");
+ 
+diff --git a/src/common/launcher_model.c b/src/common/launcher_model.c
+index 44ac872..a348369 100644
+--- a/src/common/launcher_model.c
++++ b/src/common/launcher_model.c
+@@ -586,6 +586,8 @@ void launcher_model_init(LauncherModel* m,
+         m->renderer_note        = game->renderer_note;
+         m->hide_rebind          = game->hide_rebind != 0;
+         m->has_mouse_controls   = game->has_mouse_controls != 0;
++        m->mouse_source_label   = game->mouse_source_label;
++        m->mouse_source_only    = game->mouse_source_only != 0;
+         m->has_gyro_controls    = game->has_gyro_controls != 0;
+         m->has_sharp_filter     = game->has_sharp_filter != 0;
+         m->has_affine_filter    = game->has_affine_filter != 0;
+@@ -899,7 +901,11 @@ void launcher_model_init(LauncherModel* m,
+     // seeds real defaults from its config; a zero sensitivity is the tell of a
+     // fresh/zero-initialized struct (e.g. a demo harness) — seed the full Snap
+     // default set in that case, otherwise just clamp the sensitivity.
+-    if (m->has_mouse_controls) {
++    // A host-emulated mouse device has none of the mouse-aim settings: the
++    // host's mouse_enabled stands as given.
++    if (m->has_mouse_controls && m->mouse_source_only) {
++        m->s.mouse_enabled = m->s.mouse_enabled ? 1 : 0;
++    } else if (m->has_mouse_controls) {
+         if (m->s.mouse_sensitivity <= 0.0f) {
+             m->s.player_src[0]      = 1;      // Keyboard (+ mouse) by default
+             m->s.mouse_enabled      = 1;
+@@ -4826,6 +4832,11 @@ const char* launcher_model_freq_label(const LauncherModel* m) {
+     return buf;
+ }
+ 
++const char* launcher_model_mouse_source_label(const LauncherModel* m) {
++    return (m && m->mouse_source_label && m->mouse_source_label[0])
++        ? m->mouse_source_label : "Keyboard + Mouse";
++}
++
+ const char* launcher_model_player_src_label(const LauncherModel* m, int player) {
+     player = clampi(player, 0, LNG_MAX_PLAYERS - 1);
+     int src = clampi(m->s.player_src[player], 0, 2);
+@@ -4841,7 +4852,7 @@ const char* launcher_model_player_src_label(const LauncherModel* m, int player)
+     // Mouse-capable games split the keyboard source (player 0 only): the label
+     // reflects whether mouse-aim is on. Every non-mouse game keeps kSrcNames.
+     if (src == 1 && m->has_mouse_controls && player == 0)
+-        return m->s.mouse_enabled ? "Keyboard + Mouse" : "Keyboard";
++        return m->s.mouse_enabled ? launcher_model_mouse_source_label(m) : "Keyboard";
+     return kSrcNames[src];
+ }
+ 
+diff --git a/src/common/launcher_model.h b/src/common/launcher_model.h
+index 826ced7..db4eeb4 100644
+--- a/src/common/launcher_model.h
++++ b/src/common/launcher_model.h
+@@ -363,6 +363,12 @@ typedef struct {
+     // _invert_x / _invert_y / _bind[]), like audio_device. False => none of
+     // the mouse surface composes and behavior is unchanged for every game.
+     bool has_mouse_controls;
++    // GameInfo.mouse_source_label / mouse_source_only: a host-emulated mouse
++    // device (psxrecomp's PlayStation Mouse). The entry takes that name, and
++    // the MOUSE card and mouse-aim defaults do not apply. NULL / false keep
++    // "Keyboard + Mouse" and the Snap surface.
++    const char* mouse_source_label;
++    bool mouse_source_only;
+     bool has_gyro_controls;
+     bool has_sharp_filter;
+     bool has_affine_filter;
+@@ -1300,6 +1306,9 @@ void launcher_model_cancel_hk_capture(LauncherModel* m);
+ const char* launcher_model_scale_label(const LauncherModel* m);        // "3x"
+ const char* launcher_model_freq_label(const LauncherModel* m);         // "44100 Hz"
+ const char* launcher_model_player_src_label(const LauncherModel* m, int player);
++// Name of player 1's mouse source entry: GameInfo.mouse_source_label, else
++// "Keyboard + Mouse".
++const char* launcher_model_mouse_source_label(const LauncherModel* m);
+ const char* launcher_button_name(LngButton b);
+ const char* launcher_hotkey_name(LngHotkey h);
+ const char* launcher_view_name(LngView v);
+diff --git a/src/recomp_launcher.h b/src/recomp_launcher.h
+index 1611349..78fce60 100644
+--- a/src/recomp_launcher.h
++++ b/src/recomp_launcher.h
+@@ -2442,9 +2442,26 @@ typedef struct RecompLauncherCGameInfo {
+      * Image Filtering mod) sets this so no control that nothing applies is
+      * drawn. Appended for ABI stability; zero keeps the row. */
+     int                linear_filter_hidden;
++
++    /* ---- Host-emulated mouse device (with has_mouse_controls) -------------
++     * mouse_source_label: name of player 1's mouse source entry (the
++     * keyboard-family source with Settings.mouse_enabled = 1). NULL keeps
++     * "Keyboard + Mouse" (Snap).
++     * mouse_source_only: nonzero when the mouse is a device the host emulates
++     * by itself (psxrecomp: the PlayStation Mouse in console port 1) rather
++     * than mouse-aim folded onto the pad. The launcher then offers only the
++     * source entry: no MOUSE card (sensitivity / invert / button binds) and no
++     * mouse-aim defaults; the host seeds Settings.mouse_enabled itself.
++     * Both zero keep the existing mouse-controls behaviour. Appended for ABI
++     * stability; see RECOMP_LAUNCHER_HAS_MOUSE_SOURCE. */
++    const char*        mouse_source_label;
++    int                mouse_source_only;
+ } RecompLauncherCGameInfo;
+ /* RecompLauncherCGameInfo carries linear_filter_hidden. */
+ #define RECOMP_LAUNCHER_HAS_LINEAR_FILTER_HIDDEN 1
++/* RecompLauncherCGameInfo carries has_mouse_controls, mouse_source_label and
++ * mouse_source_only; RecompLauncherCSettings carries mouse_enabled. */
++#define RECOMP_LAUNCHER_HAS_MOUSE_SOURCE 1
+ #define RECOMP_LAUNCHER_HAS_ARTWORK_GALLERY 1
+ 
+ /* RecompLauncherCGameInfo carries texture_filter_labels / _values. */
+diff --git a/tests/launcher_mouse_source_test.c b/tests/launcher_mouse_source_test.c
+new file mode 100644
+index 0000000..b262b0c
+--- /dev/null
++++ b/tests/launcher_mouse_source_test.c
+@@ -0,0 +1,156 @@
++/* Player 1's mouse source entry (GameInfo.has_mouse_controls).
++ *
++ * What this pins:
++ *   - Snap-style mouse controls are unchanged: "Keyboard + Mouse", the
++ *     mouse-aim defaults on a fresh struct, sensitivity clamping;
++ *   - a host-emulated mouse device (mouse_source_label + mouse_source_only,
++ *     psxrecomp's PlayStation Mouse) shows the host's name, keeps the
++ *     host-seeded mouse_enabled (on or off) and seeds no mouse-aim defaults;
++ *   - the source selection round-trips through mouse_enabled;
++ *   - a game without has_mouse_controls keeps the single "Keyboard" entry
++ *     even when a label is set.
++ *
++ * Includes the model translation unit (as launcher_pad_mode_test.c does).
++ */
++#include "launcher_model.c"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++void launcher_binds_set_zapper(int a, int b);
++void launcher_binds_set_zapper(int a, int b) { (void)a; (void)b; }
++
++static int fails;
++
++static void expect(int cond, const char* what) {
++    if (cond) { printf("ok: %s\n", what); return; }
++    fprintf(stderr, "FAIL: %s\n", what);
++    ++fails;
++}
++
++enum { SRC_NONE = 0, SRC_KEYBOARD = 1, SRC_GAMEPAD = 2 };
++
++static RecompLauncherCGameInfo g_game;
++static RecompLauncherCSettings g_io;
++
++static LauncherModel* session(int mouse_controls, const char* label,
++                              int source_only, int p0_src, int mouse_enabled,
++                              float sensitivity) {
++    LauncherModel* m = (LauncherModel*)calloc(1, sizeof(LauncherModel));
++    if (!m) { fprintf(stderr, "FAIL: out of memory\n"); ++fails; return NULL; }
++    memset(&g_game, 0, sizeof(g_game));
++    launcher_profile_apply_psx(&g_game);
++    g_game.name = "Mouse Source Fixture";
++    g_game.num_players = 2;
++    g_game.pad_mode_selectable = 1;
++    g_game.has_mouse_controls = mouse_controls;
++    g_game.mouse_source_label = label;
++    g_game.mouse_source_only = source_only;
++    memset(&g_io, 0, sizeof(g_io));
++    g_io.player_src[0] = p0_src;
++    g_io.mouse_enabled = mouse_enabled;
++    g_io.mouse_sensitivity = sensitivity;
++    launcher_model_init(m, &g_io, &g_game, NULL);
++    return m;
++}
++
++static void test_snap_unchanged(void) {
++    /* Fresh struct (sensitivity 0): the Snap defaults are seeded. */
++    LauncherModel* m = session(1, NULL, 0, SRC_NONE, 0, 0.0f);
++    if (!m) return;
++    expect(m->s.player_src[0] == SRC_KEYBOARD && m->s.mouse_enabled == 1,
++           "snap: a fresh struct defaults to Keyboard + Mouse");
++    expect(m->s.mouse_sensitivity > 0.05f && m->s.mouse_sensitivity < 0.07f &&
++           m->s.mouse_invert_y == 1,
++           "snap: mouse-aim defaults are seeded");
++    expect(strcmp(launcher_model_player_src_label(m, 0), "Keyboard + Mouse") == 0,
++           "snap: the entry is labelled Keyboard + Mouse");
++    expect(strcmp(launcher_model_mouse_source_label(m), "Keyboard + Mouse") == 0,
++           "snap: the mouse entry name is Keyboard + Mouse");
++    launcher_model_set_mouse_source(m, 0);
++    expect(strcmp(launcher_model_player_src_label(m, 0), "Keyboard") == 0 &&
++           m->s.mouse_enabled == 0, "snap: Keyboard turns mouse-aim off");
++    free(m);
++
++    /* Host-seeded values are only clamped. */
++    m = session(1, NULL, 0, SRC_KEYBOARD, 0, 0.9f);
++    if (!m) return;
++    expect(m->s.mouse_enabled == 0 && m->s.mouse_sensitivity == 0.50f,
++           "snap: a seeded sensitivity is clamped, mouse_enabled kept");
++    free(m);
++
++    /* An empty label is the default label. */
++    m = session(1, "", 0, SRC_KEYBOARD, 1, 0.06f);
++    if (!m) return;
++    expect(strcmp(launcher_model_player_src_label(m, 0), "Keyboard + Mouse") == 0,
++           "snap: an empty label keeps Keyboard + Mouse");
++    free(m);
++}
++
++static void test_host_mouse_device(void) {
++    /* Fresh struct: no mouse-aim defaults, the host's choice (off) stands. */
++    LauncherModel* m = session(1, "PlayStation Mouse", 1, SRC_KEYBOARD, 0, 0.0f);
++    if (!m) return;
++    expect(m->s.player_src[0] == SRC_KEYBOARD && m->s.mouse_enabled == 0,
++           "device: the host's Keyboard stays Keyboard");
++    expect(m->s.mouse_sensitivity == 0.0f && m->s.mouse_invert_y == 0 &&
++           m->s.mouse_bind[0] == 0 && m->s.mouse_bind[1] == 0,
++           "device: no mouse-aim defaults are seeded");
++    expect(strcmp(launcher_model_player_src_label(m, 0), "Keyboard") == 0,
++           "device: label Keyboard while the mouse is off");
++    expect(strcmp(launcher_model_mouse_source_label(m), "PlayStation Mouse") == 0,
++           "device: the entry carries the host's name");
++
++    /* Selecting the entry and back round-trips through mouse_enabled. */
++    launcher_model_set_mouse_source(m, 1);
++    expect(m->s.player_src[0] == SRC_KEYBOARD && m->s.mouse_enabled == 1,
++           "device: selecting the entry sets mouse_enabled");
++    expect(strcmp(launcher_model_player_src_label(m, 0), "PlayStation Mouse") == 0,
++           "device: label PlayStation Mouse while selected");
++    launcher_model_set_mouse_source(m, 0);
++    expect(m->s.mouse_enabled == 0, "device: Keyboard clears mouse_enabled");
++    launcher_model_set_source(m, 0, SRC_NONE, 0, NULL, NULL);
++    expect(strcmp(launcher_model_player_src_label(m, 0), "None") == 0,
++           "device: None is still None");
++    free(m);
++
++    /* A host-seeded mouse (e.g. p1_device = "mouse") is shown selected. */
++    m = session(1, "PlayStation Mouse", 1, SRC_KEYBOARD, 7, 0.0f);
++    if (!m) return;
++    expect(m->s.mouse_enabled == 1, "device: mouse_enabled is normalized to 1");
++    expect(strcmp(launcher_model_player_src_label(m, 0), "PlayStation Mouse") == 0,
++           "device: a seeded mouse is shown selected");
++    free(m);
++
++    /* Only player 1 has the entry. */
++    m = session(1, "PlayStation Mouse", 1, SRC_KEYBOARD, 1, 0.0f);
++    if (!m) return;
++    m->s.player_src[1] = SRC_KEYBOARD;
++    expect(strcmp(launcher_model_player_src_label(m, 1), "Keyboard") == 0,
++           "device: player 2 keyboard stays Keyboard");
++    free(m);
++}
++
++static void test_no_mouse_controls(void) {
++    LauncherModel* m = session(0, "PlayStation Mouse", 1, SRC_KEYBOARD, 1, 0.0f);
++    if (!m) return;
++    expect(strcmp(launcher_model_player_src_label(m, 0), "Keyboard") == 0,
++           "off: without has_mouse_controls the entry is plain Keyboard");
++    launcher_model_set_mouse_source(m, 0);
++    expect(m->s.mouse_enabled == 1,
++           "off: set_mouse_source is a no-op without has_mouse_controls");
++    free(m);
++}
++
++int main(void) {
++    test_snap_unchanged();
++    test_host_mouse_device();
++    test_no_mouse_controls();
++    if (fails) {
++        fprintf(stderr, "launcher_mouse_source_test: %d failure(s)\n", fails);
++        return 1;
++    }
++    printf("launcher_mouse_source_test: OK\n");
++    return 0;
++}
