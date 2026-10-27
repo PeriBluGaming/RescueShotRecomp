@@ -22,15 +22,24 @@ if(NOT PSXRECOMP_ROOT STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}/psxrecomp")
         "Use -DPSXRECOMP_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/psxrecomp.")
 endif()
 
-execute_process(
-    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/apply-framework-patches.sh"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    RESULT_VARIABLE FRAMEWORK_PATCH_RESULT
+option(PSX_FRAMEWORK_PATCHES_PREAPPLIED
+    "Framework patches were already applied before CMake configuration"
+    OFF
 )
 
-if(NOT FRAMEWORK_PATCH_RESULT EQUAL 0)
-    message(FATAL_ERROR
-        "Failed to apply local framework patches.")
+if(NOT PSX_FRAMEWORK_PATCHES_PREAPPLIED)
+    execute_process(
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/apply-framework-patches.sh"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE FRAMEWORK_PATCH_RESULT
+    )
+
+    if(NOT FRAMEWORK_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to apply local framework patches.")
+    endif()
+else()
+    message(STATUS "Framework patches already applied by CI")
 endif()
 
 
