@@ -25,7 +25,22 @@ apply_patch() {
 
     else
         echo "FEHLER: Patch für $name ist inkompatibel."
-        echo "Prüfe die Submodul-Version und lokale Änderungen."
+        echo "=== Diagnose: $name ==="
+
+        echo "Git-Version:"
+        git --version
+
+        echo "Git-Konfiguration:"
+        git -C "$repo" config --show-origin --get core.autocrlf || true
+        git -C "$repo" config --show-origin --get core.safecrlf || true
+
+        echo "Patch vorwärts prüfen:"
+        git -C "$repo" apply --check "$patch" || true
+
+        echo "Patch rückwärts prüfen:"
+        git -C "$repo" apply --check --reverse "$patch" || true
+
+        echo "=== Ende Diagnose ==="
         exit 1
     fi
 }
