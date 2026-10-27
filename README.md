@@ -10,14 +10,20 @@ Static recompilation of **RescueShot** built on
 [psxrecomp](https://github.com/mstan/psxrecomp) and
 [recomp-ui](https://github.com/RetroPortingToolKit/recomp-ui).
 
-_Add a short pitch in catalog_identity.json / README._
+**RescueShot Recompiled** brings the PlayStation light-gun shooter *Rescue Shot* to modern PCs through static recompilation powered by [PSXRecomp](https://github.com/mstan/psxrecomp).
+
+Experience the original game with modern hardware and optional **native PlayStation Mouse (SCPH-1030) support**, including precise mouse aiming, shooting, and menu navigation.
+
+Unlike conventional mouse-to-analog-stick mappings, RescueShot Recompiled emulates the original PlayStation Mouse device.
+
+The original game disc is required.
 
 | | |
 |---|---|
 | Players | 2 |
-| Region | USA |
-| Publisher | — |
-| Year | — |
+| Region | Europe, Japan |
+| Publisher | Namco |
+| Year | 2000 |
 
 Scaffolded with the New Project Layout. See
 `psxrecomp/docs/GAME_PROJECT_SETUP.md` for the full flow.
@@ -60,6 +66,98 @@ Default app icon: `assets/psxrecomp.ico` (and `.png` / `.svg`) — Retro-themed 
 Optional box art under `launcher_assets/img/` may come from
 [libretro-thumbnails](https://github.com/libretro-thumbnails/libretro-thumbnails)
 (`Named_Boxarts`); see `BOXART_SOURCE.txt` when present.
+
+## PlayStation Mouse Support
+
+RescueShot Recompiled supports the original **PlayStation Mouse (SCPH-1030)** through native mouse input emulation.
+
+### Features
+
+- **Native mouse aiming** — smooth, precise movement using your computer mouse.
+- **Left-click shooting** — fire directly with the mouse button.
+- **Menu navigation** — navigate the game's menus using your mouse.
+- **Real PlayStation Mouse emulation** — communicates through the emulated SIO0 controller interface.
+- **Launcher integration** — select *PlayStation Mouse* directly from the controller settings.
+- **Persistent configuration** — your selected input device is saved between sessions.
+- **Optional support** — standard controller input remains available.
+
+### How to enable
+
+1. Start RescueShot Recompiled.
+2. Open the launcher controller settings.
+3. Select **PlayStation Mouse** as your input device.
+4. Launch the game and enjoy native mouse controls.
+
+The feature is enabled through the project's `game.toml`:
+
+```toml
+[controller]
+default_mode = "digital"
+supports_ps_mouse = true
+```
+
+The launcher stores the selected device as `p1_device = "mouse"` in its settings.
+
+---
+
+## Local Framework Patches
+
+RescueShot Recompiled includes project-specific patches for **PSXRecomp** and **recomp-ui** to provide native PlayStation Mouse functionality.
+
+These patches allow the game to support the original PlayStation Mouse **without requiring the corresponding upstream pull requests to be merged**.
+
+### Included patches
+
+| Framework | Patch | Description |
+|---|---|---|
+| PSXRecomp | `patches/psxrecomp/0001-native-ps-mouse.patch` | Native PlayStation Mouse protocol, SDL3 host input, and runtime integration |
+| recomp-ui | `patches/recomp-ui/0001-ps-mouse-launcher.patch` | PlayStation Mouse selection in the launcher |
+
+The patches cover **34 framework files** across both repositories.
+
+### Automatic patch application
+
+After initializing the Git submodules, the patches can be applied manually:
+
+```bash
+git submodule update --init --recursive
+./scripts/apply-framework-patches.sh
+```
+
+**Manual application is not required for normal builds.** The project's `CMakeLists.txt` automatically executes the patch script during CMake configuration.
+
+The script:
+
+- Applies patches that have not yet been installed.
+- Detects and skips already applied patches.
+- Stops with an error if a patch is incompatible.
+
+### Framework compatibility
+
+The patches were tested against these specific framework commits:
+
+| Framework | Base commit |
+|---|---|
+| PSXRecomp | `a38bf783e4540bf98fe6ddd0afdca1bd181c65ec` |
+| recomp-ui | `3f1d6f122a58823614abce14f5b86f4d165a629c` |
+
+Both frameworks remain regular Git submodules. Their original commit references are preserved.
+
+When updating either framework, patch compatibility must be verified. Once the corresponding functionality becomes available upstream, the local patch can be removed.
+
+### Building from source
+
+```bash
+git clone --recurse-submodules https://github.com/PeriBluGaming/RescueShotRecomp.git
+cd RescueShotRecomp
+
+cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --target psx-runtime
+```
+
+CMake automatically applies the required framework patches before configuring the runtime.
+
+The generated game code is already committed to the repository. A normal build does not require regenerating it.
 
 ## Quick start (dev)
 
